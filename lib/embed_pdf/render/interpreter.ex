@@ -3,6 +3,9 @@ defmodule EmbedPdf.Render.GState do
   alias EmbedPdf.Render.Matrix
 
   defstruct ctm: Matrix.identity(),
+            # the CTM at the start of the current content stream (page, form
+            # or glyph): patterns are defined relative to it
+            base_ctm: Matrix.identity(),
             clip: [],
             fill_cs: :gray,
             fill: {0.0, 0.0, 0.0},
@@ -67,6 +70,7 @@ defmodule EmbedPdf.Render.Interpreter do
 
     * `:ctm` – base transform (default identity: PDF user space)
     * `:text_only` – skip images, shadings and Type 3 glyph procedures
+    * `:gs` – a `GState` to start from (its `ctm` and `clip` are replaced)
   """
   @spec run_page(Document.t(), Page.t(), emit(), term(), keyword()) :: term()
   def run_page(doc, %Page{} = page, emit, acc, opts \\ []) do
@@ -94,10 +98,16 @@ defmodule EmbedPdf.Render.Interpreter do
   end
 
   defp new_state(doc, resources, ctm, emit, acc, opts) do
+    initial =
+      case Keyword.get(opts, :gs) do
+        %GState{} = gs -> %{gs | ctm: ctm, base_ctm: ctm, clip: []}
+        _ -> %GState{ctm: ctm, base_ctm: ctm}
+      end
+
     %{
       doc: doc,
       resources: resources || %{},
-      gs: %GState{ctm: ctm},
+      gs: initial,
       stack: [],
       path: [],
       cp: {0.0, 0.0},
@@ -540,7 +550,7 @@ defmodule EmbedPdf.Render.Interpreter do
 
         inner = %{
           s
-          | gs: %{s.gs | ctm: ctm},
+          | gs: %{s.gs | ctm: ctm, base_ctm: ctm},
             stack: [],
             resources: res || s.resources,
             path: [],
@@ -588,7 +598,7 @@ defmodule EmbedPdf.Render.Interpreter do
     resources = Document.resolve(doc, dict["Resources"]) || s.resources
     group? = match?(%{"S" => "Transparency"}, Document.resolve(doc, dict["Group"]))
 
-    gs = %{s.gs | ctm: ctm}
+    gs = %{s.gs | ctm: ctm, base_ctm: ctm}
 
     gs =
       case bbox do

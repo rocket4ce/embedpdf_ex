@@ -101,9 +101,47 @@ defmodule EmbedPdf.PDF.Parser do
   @doc "Parses a PDF number, tolerating forms such as `--5`, `.5`, `5.` and `1.2.3`."
   @spec parse_number(binary()) :: {number(), binary()}
   def parse_number(input) do
-    {token, rest} = take_number_chars(input, [])
-    {to_number(token), rest}
+    case fast_number(input) do
+      {:ok, n, rest} ->
+        {n, rest}
+
+      :slow ->
+        {token, rest} = take_number_chars(input, [])
+        {to_number(token), rest}
+    end
   end
+
+  # one pass over the common forms: [+-]digits[.digits]
+  defp fast_number(<<?-, rest::binary>>), do: int_digits(rest, -1, 0, 0)
+  defp fast_number(<<?+, rest::binary>>), do: int_digits(rest, 1, 0, 0)
+  defp fast_number(input), do: int_digits(input, 1, 0, 0)
+
+  defp int_digits(<<d, rest::binary>>, sign, acc, n) when is_digit(d),
+    do: int_digits(rest, sign, acc * 10 + (d - ?0), n + 1)
+
+  defp int_digits(<<?., rest::binary>>, sign, acc, n), do: frac_digits(rest, sign, acc, 0, 0, n)
+  defp int_digits(_rest, _sign, _acc, 0), do: :slow
+
+  defp int_digits(rest, sign, acc, _n) do
+    if odd_next?(rest), do: :slow, else: {:ok, sign * acc, rest}
+  end
+
+  defp frac_digits(<<d, rest::binary>>, sign, int, frac, fl, n) when is_digit(d) and fl < 15,
+    do: frac_digits(rest, sign, int, frac * 10 + (d - ?0), fl + 1, n)
+
+  defp frac_digits(<<d, _::binary>>, _sign, _int, _frac, _fl, _n) when is_digit(d), do: :slow
+
+  defp frac_digits(rest, sign, int, frac, fl, n) do
+    if n + fl == 0 or odd_next?(rest),
+      do: :slow,
+      else: {:ok, sign * (int + frac / pow10(fl)), rest}
+  end
+
+  defp odd_next?(<<c, _::binary>>) when c in [?+, ?-, ?.], do: true
+  defp odd_next?(_), do: false
+
+  @pow10 List.to_tuple(for i <- 0..15, do: :math.pow(10, i))
+  defp pow10(n), do: elem(@pow10, n)
 
   defp take_number_chars(<<c, rest::binary>>, acc) when is_digit(c) or c in [?+, ?-, ?.],
     do: take_number_chars(rest, [c | acc])

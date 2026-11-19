@@ -304,6 +304,7 @@ defmodule EmbedPdf.Live.PageComponent do
               multiple={field.multi_select?}
               size={if type == :list, do: max(length(field.options), 2)}
             >
+              <option :if={type == :combo and field.value in [nil, ""]} value="" selected></option>
               <option :for={{export, label} <- field.options} value={export} selected={export == field.value or (is_list(field.value) and export in field.value)}>{label}</option>
             </select>
           <% _ -> %>
