@@ -66,7 +66,9 @@ defmodule EmbedPdf.Live.ViewerTest do
     assert html =~ ~s(href="##{viewer_id(view)}-page-1")
     render_click(view, "page", %{"to" => "last"})
     assert assigns(view).current_page == 3
+    render_click(view, "edit_page", %{})
     view |> form(".epdf-page-input", %{"page" => "2"}) |> render_submit()
+    refute :sys.get_state(view.pid).socket.assigns.editing_page?
     assert assigns(view).current_page == 1
   end
 

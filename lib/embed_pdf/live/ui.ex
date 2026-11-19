@@ -59,6 +59,12 @@ defmodule EmbedPdf.Live.UI do
         aria-hidden="true"
         phx-mounted={JS.dispatch("click")}
       ></a>
+      <span
+        :if={@refocus > 0}
+        id={"#{@viewer_id}-refocus-#{@refocus}"}
+        class="epdf-hidden"
+        phx-mounted={JS.focus(to: "##{@viewer_id}-viewport")}
+      ></span>
     </div>
     """
   end
@@ -478,10 +484,20 @@ defmodule EmbedPdf.Live.UI do
     <div class="epdf-pager" role="navigation">
       <button class="epdf-btn" phx-click="page" phx-value-to="first" title={t(assigns, "page.first")} aria-label={t(assigns, "page.first")}><.icon name="first" /></button>
       <button class="epdf-btn" phx-click="page" phx-value-to="prev" title={t(assigns, "page.previous")} aria-label={t(assigns, "page.previous")}><.icon name="chevron-left" /></button>
-      <form phx-submit="goto_page" class="epdf-page-input">
-        <input type="text" inputmode="numeric" name="page" value={@current_page + 1} aria-label={t(assigns, "page.label")} />
+    <form
+        :if={@editing_page?}
+        id={"#{@viewer_id}-pager"}
+        phx-submit={JS.push("goto_page") |> JS.focus(to: "##{@viewer_id}-viewport")}
+        phx-click-away="stop_page_edit"
+        class="epdf-page-input"
+      >
+        <input type="text" inputmode="numeric" name="page" value={@current_page + 1} aria-label={t(assigns, "page.label")} phx-mounted={JS.focus()} />
         <span>/ {length(@sizes)}</span>
       </form>
+
+      <button :if={!@editing_page?} class="epdf-page-input epdf-page-current" phx-click="edit_page" title={t(assigns, "page.label")}>
+        <span class="epdf-page-box">{@current_page + 1}</span> <span>/ {length(@sizes)}</span>
+      </button>
       <button class="epdf-btn" phx-click="page" phx-value-to="next" title={t(assigns, "page.next")} aria-label={t(assigns, "page.next")}><.icon name="chevron-right" /></button>
       <button class="epdf-btn" phx-click="page" phx-value-to="last" title={t(assigns, "page.last")} aria-label={t(assigns, "page.last")}><.icon name="last" /></button>
     </div>

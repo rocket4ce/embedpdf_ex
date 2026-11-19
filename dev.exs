@@ -60,7 +60,7 @@ end
 defmodule Demo.HomeLive do
   use Phoenix.LiveView
 
-  @fixtures Path.expand("test/fixtures", File.cwd!())
+  @fixtures Path.expand(System.get_env("EMBEDPDF_DEMO_DIR", "test/fixtures"), File.cwd!())
 
   def mount(params, _session, socket) do
     files = @fixtures |> File.ls!() |> Enum.filter(&String.ends_with?(&1, ".pdf")) |> Enum.sort()

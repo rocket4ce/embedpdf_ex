@@ -34,7 +34,7 @@ defmodule EmbedPdf.Live.Viewer do
   @impl true
   def mount(params, session, socket) do
     session = Map.merge(params_from(params), session || %{})
-    viewer_id = 16 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false)
+    viewer_id = "v" <> (16 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false))
 
     if connected?(socket),
       do: Phoenix.PubSub.subscribe(EmbedPdf.PubSub, "embed_pdf:viewer:" <> viewer_id)
@@ -78,6 +78,8 @@ defmodule EmbedPdf.Live.Viewer do
         selected: nil,
         moving?: false,
         resizing?: false,
+        editing_page?: false,
+        refocus: 0,
         editing_text: nil,
         style: default_style(),
         stamp: "approved",
@@ -329,6 +331,19 @@ defmodule EmbedPdf.Live.Viewer do
     {:noreply, goto(socket, target)}
   end
 
+  def handle_event("edit_page", _, socket), do: {:noreply, assign(socket, editing_page?: true)}
+
+  def handle_event("stop_page_edit", _, socket),
+    do: {:noreply, assign(socket, editing_page?: false)}
+
+  def handle_event("goto_page", %{"page" => n}, socket) when socket.assigns.editing_page?,
+    do:
+      {:noreply,
+       socket
+       |> assign(editing_page?: false)
+       |> goto(parse_int(n, 1) - 1)
+       |> tap(fn _ -> send(self(), :refocus_viewport) end)}
+
   def handle_event("goto_page", %{"page" => n}, socket),
     do: {:noreply, goto(socket, parse_int(n, 1) - 1)}
 
@@ -412,7 +427,15 @@ defmodule EmbedPdf.Live.Viewer do
     {:noreply, assign(socket, if(side == "left", do: :left, else: :right), nil)}
   end
 
-  def handle_event("key", %{"key" => key}, socket), do: {:noreply, handle_key(socket, key)}
+  def handle_event("key", %{"key" => key}, socket) do
+    # following a #fragment link drops focus; the key came from the document area,
+    # so give the keyboard back to it after navigating
+    if key in ~w(ArrowRight ArrowLeft + = - 0 1 r R) or
+         (key in ~w(PageDown PageUp Home End) and socket.assigns.scroll == :paged),
+       do: send(self(), :refocus_viewport)
+
+    {:noreply, handle_key(socket, key)}
+  end
 
   # ---------------------------------------------------------------- events: modes & tools
 
@@ -980,6 +1003,11 @@ defmodule EmbedPdf.Live.Viewer do
     {:noreply, pointer(socket, page, fx, fy)}
   end
 
+  # after a page typed in the pager: give the keyboard back to the document area,
+  # one patch after the form went away so LiveView's own focus restore is done
+  def handle_info(:refocus_viewport, socket),
+    do: {:noreply, assign(socket, refocus: socket.assigns.refocus + 1)}
+
   def handle_info(_, socket), do: {:noreply, socket}
 
   # ---------------------------------------------------------------- scroll position
@@ -987,8 +1015,8 @@ defmodule EmbedPdf.Live.Viewer do
   # A page's marker crossed the middle of the viewport. After every real
   # change the stylesheet's nonce is bumped so markers report again when
   # they come back; the reports that the new stylesheet triggers at once
-  # (pages already in the middle) are "settling" reports and only pick
-  # the topmost page, so two pages in the band cannot ping-pong.
+  # (pages already in the middle) are "settling" reports that update the
+  # page without bumping again, so two pages in the band cannot ping-pong.
   defp seen(socket, n, nonce) do
     %{seen: seen, current_page: current, status: status} = socket.assigns
     now = System.monotonic_time(:millisecond)
@@ -998,13 +1026,13 @@ defmodule EmbedPdf.Live.Viewer do
         socket
 
       seen.settle_until != nil and now < seen.settle_until ->
-        settling = [n | seen.settling]
-        top = Enum.min(settling)
-        socket = assign(socket, seen: %{seen | settling: settling})
+        # settling reports never bump the nonce, so following the latest one
+        # cannot ping-pong; it is also the page where a fast scroll ended
+        socket = assign(socket, seen: %{seen | settling: [n | seen.settling]})
 
         socket =
-          if top != current,
-            do: socket |> assign(current_page: top) |> notify_parent({:page, top + 1}),
+          if n != current,
+            do: socket |> assign(current_page: n) |> notify_parent({:page, n + 1}),
             else: socket
 
         ensure_loaded(socket, n)
@@ -1573,7 +1601,11 @@ defmodule EmbedPdf.Live.Viewer do
           else: "#{socket.assigns.viewer_id}-page-#{n}"
 
       socket
-      |> assign(current_page: n, scroll_to: target, scroll_nonce: socket.assigns.scroll_nonce + 1)
+      |> assign(
+        current_page: n,
+        scroll_to: target,
+        scroll_nonce: socket.assigns.scroll_nonce + 1
+      )
       |> ensure_loaded(n)
       |> notify_parent({:page, n + 1})
     end
@@ -1585,10 +1617,10 @@ defmodule EmbedPdf.Live.Viewer do
     a = socket.assigns
 
     case key do
-      k when k in ["ArrowRight", "PageDown"] and a.scroll != :vertical ->
+      k when k in ["ArrowRight", "PageDown"] and a.scroll == :paged ->
         elem(handle_event("page", %{"to" => "next"}, socket), 1)
 
-      k when k in ["ArrowLeft", "PageUp"] and a.scroll != :vertical ->
+      k when k in ["ArrowLeft", "PageUp"] and a.scroll == :paged ->
         elem(handle_event("page", %{"to" => "prev"}, socket), 1)
 
       "ArrowRight" ->
@@ -1596,6 +1628,14 @@ defmodule EmbedPdf.Live.Viewer do
 
       "ArrowLeft" ->
         elem(handle_event("page", %{"to" => "prev"}, socket), 1)
+
+      # the browser scrolls a focused scroll area itself on Home/End;
+      # an anchor jump on top would race with its smooth scrolling
+      "Home" when a.scroll != :paged ->
+        assign(socket, current_page: 0)
+
+      "End" when a.scroll != :paged ->
+        assign(socket, current_page: length(a.sizes) - 1)
 
       "Home" ->
         goto(socket, 0)

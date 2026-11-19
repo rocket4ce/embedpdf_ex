@@ -134,9 +134,10 @@ defmodule EmbedPdf.Live.CSS do
      middle of the viewport, so the browser fetches it then (scroll-driven animation) */
   .epdf-seen{position:absolute;left:0;width:1px;height:1px;opacity:0;pointer-events:none;background-size:1px 1px;
     animation-name:epdf-seen;animation-duration:auto;animation-timing-function:linear;animation-fill-mode:both;animation-timeline:view()}
-  .epdf-seen-1{top:16%}.epdf-seen-2{top:50%}.epdf-seen-3{top:84%}
+  /* seven markers ~14% apart: the page covering the middle band always has one in it */
+  .epdf-seen-1{top:7%}.epdf-seen-2{top:21%}.epdf-seen-3{top:36%}.epdf-seen-4{top:50%}.epdf-seen-5{top:64%}.epdf-seen-6{top:79%}.epdf-seen-7{top:93%}
   .epdf-scroll-horizontal .epdf-seen{animation-timeline:view(inline);top:50%}
-  .epdf-scroll-horizontal .epdf-seen-1{left:16%}.epdf-scroll-horizontal .epdf-seen-2{left:50%}.epdf-scroll-horizontal .epdf-seen-3{left:84%}
+  .epdf-scroll-horizontal .epdf-seen-1{left:7%}.epdf-scroll-horizontal .epdf-seen-2{left:21%}.epdf-scroll-horizontal .epdf-seen-3{left:36%}.epdf-scroll-horizontal .epdf-seen-4{left:50%}.epdf-scroll-horizontal .epdf-seen-5{left:64%}.epdf-scroll-horizontal .epdf-seen-6{left:79%}.epdf-scroll-horizontal .epdf-seen-7{left:93%}
   .epdf-scroll-paged .epdf-seen{display:none}
   @keyframes epdf-seen{0%,38%{background-image:none}39%,61%{background-image:var(--epdf-seen)}62%,100%{background-image:none}}
 
@@ -189,6 +190,8 @@ defmodule EmbedPdf.Live.CSS do
   .epdf-pager .epdf-btn{border-radius:999px;height:30px;min-width:30px}
   .epdf-page-input{display:flex;align-items:center;gap:6px;margin:0 4px;font-variant-numeric:tabular-nums;color:var(--epdf-muted)}
   .epdf-page-input input{width:46px;text-align:center;padding:3px 4px!important}
+  .epdf-page-current{border:0;background:none;font:inherit;cursor:text;padding:0}
+  .epdf-page-box{display:inline-block;min-width:46px;text-align:center;padding:3px 4px;border:1px solid var(--epdf-border);border-radius:6px;color:var(--epdf-text);background:var(--epdf-surface)}
 
   /* panels content */
   .epdf-thumbs{display:flex;flex-direction:column;align-items:center;gap:14px;padding:4px}
