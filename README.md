@@ -6,7 +6,8 @@ JavaScript to write, no WebAssembly and no native code.
 
 - **Engine**: parses, decrypts, renders (to SVG), searches and edits PDFs in Elixir/OTP.
 - **Viewer**: a complete LiveView UI: toolbar, modes, thumbnails, outline, search,
-  annotations, forms, redaction and page editing.
+  annotations and shapes, stamps, comments, form filling and building, redaction,
+  digital signatures, measurement, page editing and document tabs, in 15 languages.
 - **No custom JavaScript**: the browser runs only LiveView's own client, which every
   LiveView app already loads.
 
@@ -40,16 +41,34 @@ Or open the document yourself and keep its id to read the edited version later:
 {:ok, doc} = EmbedPdf.open(bytes)
 doc_id = EmbedPdf.Store.put(doc, name: "contract.pdf")
 # ...after the user is done:
-edited = EmbedPdf.Store.get(doc_id).doc
-File.write!("contract-signed.pdf", EmbedPdf.save(edited))
+entry = EmbedPdf.Store.get(doc_id)
+File.write!("contract-edited.pdf", EmbedPdf.Output.bytes(entry))
 ```
 
-Options: `locale` (`"en"`, `"es"`, or your own `translations`), `theme`
+`EmbedPdf.Output.bytes/2` writes a document that was opened signed as an incremental
+update, so its signatures stay valid; anything else is written as a fresh file.
+
+Options: `locale` (`en`, `es`, `de`, `fr`, `it`, `pt`, `nl`, `sv`, `pl`, `ja`, `ko`,
+`zh-CN`, `zh-TW`, `ar`, `he`, or your own `translations`), `theme`
 (`"light"`, `"dark"`, `"system"`), `features` (same names as EmbedPDF, such as
 `%{"redaction" => true, "annotations.drawing" => false}`), `read_only`, `mode`,
 `zoom`, `page`.
 
-Try the demo with `mix run dev.exs`, then open http://localhost:4000.
+Try the demo with `mix run dev.exs`, then open http://localhost:4000. Set
+`EMBEDPDF_DEMO_DIR` to browse another folder of PDFs.
+
+### Sealing signatures
+
+Filling signature fields works out of the box. To seal them with a digital signature,
+configure a signer:
+
+```elixir
+config :embedpdf_ex, signer: {:pem, File.read!("cert.pem"), File.read!("key.pem")}
+```
+
+You can also pass `{:remote, cert_der, fun}` to sign with a key held elsewhere (an HSM
+or signing service): `fun` receives the digest to sign and returns the raw signature.
+See `EmbedPdf.Signatures.sign/3`.
 
 ## Using the engine directly
 
@@ -92,8 +111,9 @@ Some interactions cannot be identical without JavaScript:
   sends only the key. The viewer uses plain keys (`+`, `-`, `←`, `→`, `Home`, `End`,
   `r`, `h`, `f`, `?`, `Esc`, `Delete`).
 - **Clipboard**: copying text uses the browser's own selection. Snapshots download as SVG.
-- **Not implemented yet**: digital signatures (signing and validation), JavaScript in
-  PDFs, JPEG 2000 and JBIG2 images (shown as placeholders), and form building.
+- **Not implemented yet**: JavaScript in PDFs (form calculations and actions), JPEG 2000
+  and JBIG2 images (shown as placeholders), certificate trust and revocation checks for
+  signatures, and saving with editing restrictions or encryption.
 - **Rendering**: SVG drawn by an Elixir renderer; it matches PDFium on common
   documents but may differ on complex ones.
 
