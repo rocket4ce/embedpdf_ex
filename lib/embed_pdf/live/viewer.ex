@@ -96,6 +96,7 @@ defmodule EmbedPdf.Live.Viewer do
         scroll_nonce: 0,
         outline: nil,
         outline_open: MapSet.new(),
+        outline_renaming: nil,
         attachments: nil,
         fields: nil,
         fullscreen?: false,
@@ -762,6 +763,15 @@ defmodule EmbedPdf.Live.Viewer do
     {:noreply, socket |> commit(doc, []) |> assign(outline: nil) |> refresh_lists()}
   end
 
+  def handle_event("outline_rename", %{"id" => id}, socket),
+    do: {:noreply, assign(socket, outline_renaming: parse_int(id, 0))}
+
+  def handle_event("outline_rename_cancel", _, socket),
+    do: {:noreply, assign(socket, outline_renaming: nil)}
+
+  def handle_event("outline_edit", %{"oid" => id} = params, socket),
+    do: handle_event("outline_edit", params |> Map.delete("oid") |> Map.put("id", id), socket)
+
   def handle_event("outline_edit", %{"id" => id, "action" => action} = params, socket) do
     id = parse_int(id, 0)
     doc = socket.assigns.doc
@@ -779,7 +789,10 @@ defmodule EmbedPdf.Live.Viewer do
       end
 
     {:noreply,
-     socket |> commit(normalize_doc(doc), []) |> assign(outline: nil) |> refresh_lists()}
+     socket
+     |> commit(normalize_doc(doc), [])
+     |> assign(outline: nil, outline_renaming: nil)
+     |> refresh_lists()}
   end
 
   def handle_event("attachment_delete", %{"id" => id}, socket) do

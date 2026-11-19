@@ -110,7 +110,11 @@ defmodule EmbedPdf.Live.ViewerTest do
 
     # calibrate: the half page is 10 m
     render_click(view, "measure_dialog", %{})
-    view |> form("##{viewer_id(view)}-calibrate", %{"length" => "10", "unit" => "m"}) |> render_submit()
+
+    view
+    |> form("##{viewer_id(view)}-calibrate", %{"length" => "10", "unit" => "m"})
+    |> render_submit()
+
     assert render(view) =~ "10.0 m"
 
     # keep it as a line-dimension annotation

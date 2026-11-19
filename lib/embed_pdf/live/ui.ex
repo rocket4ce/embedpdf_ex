@@ -23,6 +23,8 @@ defmodule EmbedPdf.Live.UI do
       class={["epdf", @fullscreen? && "epdf-fullscreen", "epdf-tool-#{@tool}", "epdf-mode-#{@mode}"]}
       data-epdf-viewer={@viewer_id}
       data-theme={@theme}
+      dir={if I18n.rtl?(@locale), do: "rtl", else: "ltr"}
+      lang={I18n.normalize(@locale)}
     >
       <link rel="stylesheet" href={"#{@base}/assets/viewer.css?v=#{EmbedPdf.Live.CSS.version()}"} />
       <link :if={@status == :ready} rel="stylesheet" href={"#{@base}/probe/#{@viewer_id}/#{@probe_nonce}.css"} />
@@ -593,7 +595,19 @@ defmodule EmbedPdf.Live.UI do
             <.icon name={if MapSet.member?(@outline_open, item.id), do: "chevron-down", else: "chevron-right"} class="epdf-icon-sm" />
           </button>
           <span :if={(item.children || []) == []} class="epdf-tree-spacer"></span>
-          <%= case outline_target(item) do %>
+          <form
+            :if={@outline_renaming == item.id}
+            id={"#{@viewer_id}-outline-rename-#{item.id}"}
+            class="epdf-inline-form epdf-tree-rename"
+            phx-submit="outline_edit"
+            phx-click-away="outline_rename_cancel"
+          >
+            <input type="hidden" name="oid" value={item.id} />
+            <input type="hidden" name="action" value="rename" />
+            <input type="text" name="title" value={item.title} phx-mounted={JS.focus()} />
+          </form>
+          <%= case @outline_renaming != item.id && outline_target(item) do %>
+            <% false -> %>
             <% {:page, p} -> %>
               <a href={"##{@viewer_id}-page-#{p}"} class={["epdf-tree-link", item[:bold?] && "is-bold", item[:italic?] && "is-italic"]} phx-click="outline_goto" phx-value-page={p}>{item.title}</a>
             <% {:uri, uri} -> %>
@@ -602,6 +616,8 @@ defmodule EmbedPdf.Live.UI do
               <span class="epdf-tree-link">{item.title}</span>
           <% end %>
           <div :if={@f["outline.editing"]} class="epdf-tree-actions">
+            <button class="epdf-btn epdf-btn-sm" phx-click="outline_rename" phx-value-id={item.id} title={t(assigns, "outline.rename")}><.icon name="text" class="epdf-icon-sm" /></button>
+            <button class="epdf-btn epdf-btn-sm" phx-click="outline_edit" phx-value-id={item.id} phx-value-action="here" title={t(assigns, "outline.here")}><.icon name="bookmark" class="epdf-icon-sm" /></button>
             <button class="epdf-btn epdf-btn-sm" phx-click="outline_edit" phx-value-id={item.id} phx-value-action="up" title={t(assigns, "outline.up")}><.icon name="chevron-up" class="epdf-icon-sm" /></button>
             <button class="epdf-btn epdf-btn-sm" phx-click="outline_edit" phx-value-id={item.id} phx-value-action="down" title={t(assigns, "outline.down")}><.icon name="chevron-down" class="epdf-icon-sm" /></button>
             <button class="epdf-btn epdf-btn-sm epdf-danger" phx-click="outline_edit" phx-value-id={item.id} phx-value-action="delete" title={t(assigns, "outline.delete")}><.icon name="trash" class="epdf-icon-sm" /></button>

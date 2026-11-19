@@ -68,6 +68,8 @@ defmodule EmbedPdf.Live.CSS do
   .epdf-menu-wrap{position:relative}
   .epdf-menu{position:absolute;top:calc(100% + 6px);left:0;z-index:50;min-width:220px;max-height:70vh;overflow:auto;padding:6px;background:var(--epdf-surface);border:1px solid var(--epdf-border);border-radius:var(--epdf-radius);box-shadow:var(--epdf-shadow)}
   .epdf-menu-right{left:auto;right:0}
+  .epdf[dir="rtl"] .epdf-menu{left:auto;right:0}.epdf[dir="rtl"] .epdf-menu-right{right:auto;left:0}
+  .epdf[dir="rtl"] .epdf-right{margin-left:0;margin-right:auto}
   .epdf-menu-center{left:50%;transform:translateX(-50%);min-width:170px}
   .epdf-menu hr{border:0;border-top:1px solid var(--epdf-border);margin:6px 0}
   .epdf-menu-label{font-size:12px;color:var(--epdf-muted);padding:6px 10px 2px;text-transform:uppercase;letter-spacing:.04em}
@@ -117,7 +119,7 @@ defmodule EmbedPdf.Live.CSS do
   @media (max-width:720px){.epdf-panel{position:absolute;top:0;bottom:0;z-index:40;box-shadow:var(--epdf-shadow)}.epdf-panel-left{left:0}.epdf-panel-right{right:0;width:min(320px,90vw)}.epdf-title{display:none}}
 
   /* viewport & pages */
-  .epdf-viewport{position:relative;flex:1;overflow:auto;container-name:epdfvp;container-type:size;outline:none;overscroll-behavior:contain}
+  .epdf-viewport{direction:ltr;position:relative;flex:1;overflow:auto;container-name:epdfvp;container-type:size;outline:none;overscroll-behavior:contain}
   .epdf-viewport.epdf-pan{cursor:grab}
   .epdf-probe-w,.epdf-probe-h{position:absolute;top:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none;background-size:1px 1px}
   .epdf-pages{display:flex;flex-direction:column;align-items:center;gap:var(--epdf-gap);padding:var(--epdf-gap);min-width:min-content;min-height:100%}
@@ -209,6 +211,7 @@ defmodule EmbedPdf.Live.CSS do
   .epdf-tree-link{flex:1;color:var(--epdf-text);text-decoration:none;padding:4px 2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .epdf-tree-link.is-bold{font-weight:700}.epdf-tree-link.is-italic{font-style:italic}
   .epdf-tree-actions{display:none}
+  .epdf-tree-rename{flex:1;margin:2px 0}
   .epdf-tree-row:hover .epdf-tree-actions{display:flex}
   .epdf-inline-form{display:flex;gap:6px;margin-top:8px}
   .epdf-inline-form input{flex:1;min-width:0}

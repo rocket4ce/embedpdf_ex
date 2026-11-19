@@ -117,6 +117,7 @@ defmodule EmbedPdf.I18n do
     "outline.add" => "Add bookmark",
     "outline.add_child" => "Add child bookmark",
     "outline.rename" => "Rename",
+    "outline.here" => "Point to the current page",
     "outline.delete" => "Delete",
     "outline.up" => "Move up",
     "outline.down" => "Move down",
@@ -358,6 +359,7 @@ defmodule EmbedPdf.I18n do
     "outline.add" => "Añadir marcador",
     "outline.add_child" => "Añadir submarcador",
     "outline.rename" => "Renombrar",
+    "outline.here" => "Apuntar a la página actual",
     "outline.delete" => "Eliminar",
     "outline.up" => "Subir",
     "outline.down" => "Bajar",
@@ -490,18 +492,78 @@ defmodule EmbedPdf.I18n do
 
   @locales %{"en" => @en, "es" => @es}
 
+  # the other languages live in EmbedPdf.I18n.<Code> modules (lib/embed_pdf/i18n/)
+  @modules %{
+    "ar" => EmbedPdf.I18n.Ar,
+    "de" => EmbedPdf.I18n.De,
+    "fr" => EmbedPdf.I18n.Fr,
+    "he" => EmbedPdf.I18n.He,
+    "it" => EmbedPdf.I18n.It,
+    "ja" => EmbedPdf.I18n.Ja,
+    "ko" => EmbedPdf.I18n.Ko,
+    "nl" => EmbedPdf.I18n.Nl,
+    "pl" => EmbedPdf.I18n.Pl,
+    "pt" => EmbedPdf.I18n.Pt,
+    "sv" => EmbedPdf.I18n.Sv,
+    "zh-CN" => EmbedPdf.I18n.ZhCN,
+    "zh-TW" => EmbedPdf.I18n.ZhTW
+  }
+
+  @rtl ~w(ar he)
+
   @doc "Translates `key` for `locale` with `%{name}` interpolation."
   @spec t(String.t(), String.t(), map(), map()) :: String.t()
   def t(locale, key, bindings \\ %{}, overrides \\ %{}) do
-    text =
-      Map.get(overrides, key) ||
-        get_in(@locales, [locale, key]) ||
-        get_in(@locales, [locale |> String.split("-") |> hd(), key]) ||
-        Map.get(@en, key, key)
+    text = Map.get(overrides, key) || Map.get(table(locale), key) || Map.get(@en, key, key)
 
     Enum.reduce(bindings, text, fn {k, v}, acc -> String.replace(acc, "%{#{k}}", to_string(v)) end)
   end
 
   @doc "Locales with built-in translations."
-  def locales, do: Map.keys(@locales)
+  def locales, do: Map.keys(@locales) ++ Map.keys(@modules)
+
+  @doc "Whether a locale is written right to left."
+  def rtl?(locale), do: normalize(locale) in @rtl
+
+  @doc "Canonical form of a locale code (`zh_cn` → `zh-CN`, `pt-BR` → `pt`)."
+  def normalize(locale) when is_binary(locale) do
+    l = locale |> String.replace("_", "-") |> String.downcase()
+
+    cond do
+      l in ["zh-cn", "zh-hans", "zh-sg", "zh"] -> "zh-CN"
+      l in ["zh-tw", "zh-hant", "zh-hk"] -> "zh-TW"
+      true -> l |> String.split("-") |> hd()
+    end
+  end
+
+  def normalize(_), do: "en"
+
+  defp table(locale) do
+    locale = normalize(locale)
+
+    case @locales do
+      %{^locale => strings} -> strings
+      _ -> module_strings(locale)
+    end
+  end
+
+  defp module_strings(locale) do
+    key = {__MODULE__, locale}
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        mod = Map.get(@modules, locale)
+
+        strings =
+          if mod && Code.ensure_loaded?(mod) && function_exported?(mod, :strings, 0),
+            do: mod.strings(),
+            else: %{}
+
+        :persistent_term.put(key, strings)
+        strings
+
+      strings ->
+        strings
+    end
+  end
 end

@@ -158,6 +158,15 @@ defmodule EmbedPdf.Live.EditingTest do
     view |> form(".epdf-outline form", %{"title" => "My bookmark"}) |> render_submit()
     assert length(EmbedPdf.Outline.tree(a(view).doc)) == count + 1
     assert render(view) =~ "My bookmark"
+
+    item = EmbedPdf.Outline.tree(a(view).doc) |> List.last()
+    render_click(view, "outline_rename", %{"id" => "#{item.id}"})
+
+    view
+    |> form("##{a(view).viewer_id}-outline-rename-#{item.id}", %{"title" => "Renamed"})
+    |> render_submit()
+
+    assert EmbedPdf.Outline.tree(a(view).doc) |> List.last() |> Map.get(:title) == "Renamed"
   end
 
   test "resize an annotation by clicking its new corner" do
