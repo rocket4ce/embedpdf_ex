@@ -65,6 +65,7 @@ defmodule EmbedPdf.Live.PageComponent do
       editing_text: on_page.(a.editing_text),
       points: for({^i, p} <- a.points, do: p),
       measure: if(a.measure && a.measure.page == i, do: a.measure),
+      measure_scale: a.measure_scale,
       fields: if(forms?, do: a.fields || [], else: []),
       forms?: forms?,
       design?: design?,
@@ -255,10 +256,7 @@ defmodule EmbedPdf.Live.PageComponent do
   defp measure_mark(assigns) do
     {x0, y0} = Layout.rotate_point(assigns.measure.from, assigns.usize, assigns.rotation)
     {x1, y1} = Layout.rotate_point(assigns.measure.to, assigns.usize, assigns.rotation)
-    pts = assigns.measure.points
-
-    label =
-      "#{:erlang.float_to_binary(pts / 72 * 25.4, decimals: 1)} mm · #{:erlang.float_to_binary(pts / 72, decimals: 2)} in"
+    label = Viewer.measure_label(assigns.measure_scale, assigns.measure.points)
 
     assigns = assign(assigns, x0: x0, y0: y0, x1: x1, y1: y1, label: label)
 

@@ -102,6 +102,8 @@ defmodule EmbedPdf.Live.Viewer do
         selected_pages: MapSet.new(),
         snapshot: nil,
         measure: nil,
+        # real-world units per PDF point, set by calibrating (default: millimetres)
+        measure_scale: %{factor: 25.4 / 72, unit: "mm"},
         flash_msg: nil,
         pending_password: nil,
         tabs: [],
@@ -967,6 +969,49 @@ defmodule EmbedPdf.Live.Viewer do
 
   def handle_event("snapshot_close", _, socket), do: {:noreply, assign(socket, snapshot: nil)}
 
+  # the measured distance is worth `length` `unit`: derive the scale from it
+  def handle_event("calibrate", %{"length" => length, "unit" => unit}, socket) do
+    case {socket.assigns.measure, parse_float(length, 0.0)} do
+      {%{points: pts}, real} when real > 0 and pts > 0 ->
+        {:noreply,
+         assign(socket,
+           measure_scale: %{factor: real / pts, unit: String.slice(unit, 0, 8)},
+           dialog: nil
+         )}
+
+      _ ->
+        {:noreply, assign(socket, dialog: nil)}
+    end
+  end
+
+  def handle_event("measure_dialog", _, socket),
+    do: {:noreply, assign(socket, dialog: :calibrate)}
+
+  # keep the measurement in the document as a line-dimension annotation
+  def handle_event("measure_save", _, socket) do
+    case socket.assigns.measure do
+      %{page: page, from: p1, to: p2, points: pts} ->
+        {x1, y1} = to_user(socket, page, p1)
+        {x2, y2} = to_user(socket, page, p2)
+
+        attrs = %{
+          subtype: :line,
+          line: {x1, y1, x2, y2},
+          line_endings: {:butt, :butt},
+          rect: bounds([{x1, y1}, {x2, y2}], 8),
+          color: {0.894, 0.259, 0.204},
+          border_width: 1.5,
+          contents: measure_label(socket.assigns.measure_scale, pts),
+          custom: %{"IT" => "LineDimension", "Cap" => true}
+        }
+
+        {:noreply, socket |> add_annotation(page, attrs) |> assign(measure: nil)}
+
+      _ ->
+        {:noreply, socket}
+    end
+  end
+
   def handle_event("link_create", params, socket) do
     case socket.assigns.points do
       [{page, p1}, {page, p2}] ->
@@ -1705,6 +1750,13 @@ defmodule EmbedPdf.Live.Viewer do
       _ ->
         socket
     end
+  end
+
+  @doc false
+  def measure_label(%{factor: f, unit: unit}, points) do
+    value = points * f
+    digits = if value >= 100, do: 0, else: if(value >= 10, do: 1, else: 2)
+    "#{:erlang.float_to_binary(value / 1, decimals: digits)} #{unit}"
   end
 
   defp clear_tool(socket),

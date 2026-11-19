@@ -106,7 +106,18 @@ defmodule EmbedPdf.Live.ViewerTest do
     send(view.pid, {:embed_pdf, {:pointer, 0, 0.0, 0.5, nil}})
     send(view.pid, {:embed_pdf, {:pointer, 0, 0.5, 0.5, nil}})
     html = render(view)
-    assert html =~ "4.25 in"
+    assert html =~ "108 mm"
+
+    # calibrate: the half page is 10 m
+    render_click(view, "measure_dialog", %{})
+    view |> form("##{viewer_id(view)}-calibrate", %{"length" => "10", "unit" => "m"}) |> render_submit()
+    assert render(view) =~ "10.0 m"
+
+    # keep it as a line-dimension annotation
+    render_click(view, "measure_save", %{})
+    doc = assigns(view).doc
+    assert [line] = Enum.filter(EmbedPdf.Annotations.list(doc, 0), &(&1.subtype == :line))
+    assert line.contents == "10.0 m"
   end
 
   test "keyboard shortcuts" do

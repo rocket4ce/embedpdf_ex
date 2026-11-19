@@ -414,6 +414,8 @@ defmodule EmbedPdf.Live.UI do
       <button :if={@tool in [:ink, :polygon, :polyline]} class="epdf-btn epdf-btn-text epdf-primary" phx-click="finish_tool" disabled={length(@points) < 2}>
         {t(assigns, "tool.finish")}
       </button>
+      <button :if={@measure} class="epdf-btn epdf-btn-text" phx-click="measure_dialog">{t(assigns, "measure.calibrate")}</button>
+      <button :if={@measure} class="epdf-btn epdf-btn-text epdf-primary" phx-click="measure_save">{t(assigns, "measure.keep")}</button>
       <button class="epdf-btn epdf-btn-text" phx-click="cancel_tool">{t(assigns, "tool.cancel")}</button>
     </div>
     """
@@ -830,6 +832,16 @@ defmodule EmbedPdf.Live.UI do
             <.password_dialog {assigns} />
           <% @dialog == :link -> %>
             <.link_dialog {assigns} />
+          <% @dialog == :calibrate -> %>
+            <h3>{t(assigns, "measure.calibrate")}</h3>
+            <p class="epdf-muted">{t(assigns, "measure.calibrate_text")}</p>
+            <form id={"#{@viewer_id}-calibrate"} phx-submit="calibrate" class="epdf-inline-form">
+              <input type="number" name="length" step="any" min="0" required phx-mounted={JS.focus()} />
+              <select name="unit">
+                <option :for={u <- ~w(mm cm m in ft yd km mi)} value={u} selected={u == @measure_scale.unit}>{u}</option>
+              </select>
+              <button class="epdf-btn epdf-btn-text epdf-primary" type="submit">{t(assigns, "ok")}</button>
+            </form>
           <% @dialog == :open -> %>
             <h3>{t(assigns, "open.title")}</h3>
             <div class="epdf-drop" phx-drop-target={@uploads.pdf.ref}>

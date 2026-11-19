@@ -238,6 +238,9 @@ defmodule EmbedPdf.I18n do
     "snapshot.save" => "Save image",
     "measure.distance" => "Distance",
     "measure.scale" => "Scale",
+    "measure.calibrate" => "Calibrate",
+    "measure.calibrate_text" => "How long is the line you just measured, in real life?",
+    "measure.keep" => "Keep",
     "link.url" => "Web address",
     "link.page" => "Go to page",
     "link.create" => "Create link"
@@ -477,6 +480,9 @@ defmodule EmbedPdf.I18n do
     "snapshot.save" => "Guardar imagen",
     "measure.distance" => "Distancia",
     "measure.scale" => "Escala",
+    "measure.calibrate" => "Calibrar",
+    "measure.calibrate_text" => "¿Cuánto mide en la realidad la línea que acabas de medir?",
+    "measure.keep" => "Conservar",
     "link.url" => "Dirección web",
     "link.page" => "Ir a la página",
     "link.create" => "Crear enlace"
