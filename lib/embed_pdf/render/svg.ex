@@ -1088,6 +1088,7 @@ defmodule EmbedPdf.Render.SVG do
 
   defp draw_annotations(st, view, skip) do
     skip = MapSet.new(skip)
+    st = %{st | doc: with_field_appearances(st.doc, st.page)}
 
     st.doc
     |> annotations(st.page)
@@ -1096,6 +1097,13 @@ defmodule EmbedPdf.Render.SVG do
 
       if MapSet.member?(skip, num), do: st, else: draw_annotation(st, view, ref, annot, false)
     end)
+  end
+
+  # form fields saved without an appearance are drawn from their value
+  defp with_field_appearances(doc, page) do
+    EmbedPdf.Forms.ensure_appearances(doc, page.index)
+  rescue
+    _ -> doc
   end
 
   defp draw_annotation(st, view, _ref, annot, force?) do

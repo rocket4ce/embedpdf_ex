@@ -100,7 +100,26 @@ defmodule EmbedPdf.Font do
       symbolic?: symbolic? or standard in ["Symbol", "ZapfDingbats"],
       program: program
     }
+    |> program_widths()
   end
+
+  # a font dictionary without /Widths (and without standard metrics) takes
+  # its advances from the embedded program
+  defp program_widths(%__MODULE__{widths: w, program: program} = font)
+       when map_size(w) == 0 and program != nil do
+    widths =
+      for code <- 0..255,
+          width = Program.advance(program, font, code),
+          is_number(width) and width > 0,
+          into: %{},
+          do: {code, width}
+
+    %{font | widths: widths}
+  rescue
+    _ -> font
+  end
+
+  defp program_widths(font), do: font
 
   defp descriptor_metric(doc, descriptor, key, afm_value, default) do
     case Document.resolve(doc, descriptor[key]) do

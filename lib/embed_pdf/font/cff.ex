@@ -24,7 +24,9 @@ defmodule EmbedPdf.Font.CFF do
             matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
             num_glyphs: 0,
             encoding: :standard,
-            charstring_type: 2
+            charstring_type: 2,
+            default_width: 0,
+            nominal_width: 0
 
   @type t :: %__MODULE__{}
 
@@ -102,7 +104,7 @@ defmodule EmbedPdf.Font.CFF do
     else
       cid? = Map.has_key?(top, {12, 30})
       charset = parse_charset(data, first(top[15]) || 0, n)
-      {_private, subrs} = private(data, top[18])
+      {private, subrs} = private(data, top[18])
       top_matrix = matrix(top[{12, 7}])
 
       base = %__MODULE__{
@@ -114,7 +116,9 @@ defmodule EmbedPdf.Font.CFF do
         cid?: cid?,
         num_glyphs: n,
         matrix: top_matrix || [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
-        charstring_type: first(top[{12, 6}]) || 2
+        charstring_type: first(top[{12, 6}]) || 2,
+        default_width: first(private[20]) || 0,
+        nominal_width: first(private[21]) || 0
       }
 
       cff =
@@ -498,6 +502,33 @@ defmodule EmbedPdf.Font.CFF do
   # ---------------------------------------------------------------- glyphs
 
   @doc """
+  The advance width of glyph `gid` in text space for size 1 (name-keyed
+  fonts), from the width its charstring carries or the font's default.
+  """
+  @spec advance(t(), non_neg_integer()) :: float() | nil
+  def advance(%__MODULE__{charstring_type: 2, cid?: false} = cff, gid) when is_integer(gid) do
+    [a | _] = cff.matrix
+
+    case index_get(cff.charstrings, gid) do
+      nil ->
+        nil
+
+      cs ->
+        ctx = %{gsubrs: cff.gsubrs, subrs: cff.subrs, seac: fn _ -> nil end}
+
+        case Type2.width(cs, ctx) do
+          {:ok, w} -> (cff.nominal_width + w) * a
+          :default -> cff.default_width * a
+          :unknown -> nil
+        end
+    end
+  rescue
+    _ -> nil
+  end
+
+  def advance(_, _), do: nil
+
+  @doc """
   Outline of glyph `gid` in text space for size 1 (FontMatrix applied),
   or nil when it does not exist.
   """
@@ -572,6 +603,22 @@ defmodule EmbedPdf.Font.CFF.Type2 do
     _ -> :error
   end
 
+  @doc """
+  The width operand a charstring opens with: `{:ok, w}` (to add to
+  nominalWidthX), `:default` (the glyph has the default width) or
+  `:unknown` (the charstring could not be run). `ctx` as in `run/2`.
+  """
+  @spec width(binary(), map()) :: {:ok, number()} | :default | :unknown
+  def width(cs, ctx) do
+    case exec(cs, new_state(), ctx, 0) do
+      {:error, _} -> :unknown
+      {_, %{width: :default}} -> :default
+      {_, %{width: w}} when is_number(w) -> {:ok, w}
+    end
+  rescue
+    _ -> :unknown
+  end
+
   defp new_state,
     do: %{
       x: 0.0,
@@ -579,6 +626,7 @@ defmodule EmbedPdf.Font.CFF.Type2 do
       stack: [],
       stems: 0,
       width?: false,
+      width: :default,
       path: [],
       open?: false,
       ops: 0,
@@ -627,7 +675,7 @@ defmodule EmbedPdf.Font.CFF.Type2 do
 
   # hints
   defp exec(<<op, rest::binary>>, st, ctx, d) when op in [1, 3, 18, 23] do
-    args = take_width(st, args(st), :even)
+    {args, st} = take_width(st, args(st), :even)
 
     exec(
       rest,
@@ -638,7 +686,7 @@ defmodule EmbedPdf.Font.CFF.Type2 do
   end
 
   defp exec(<<op, rest::binary>>, st, ctx, d) when op in [19, 20] do
-    args = take_width(st, args(st), :even)
+    {args, st} = take_width(st, args(st), :even)
     stems = st.stems + div(length(args), 2)
     skip = div(stems + 7, 8)
 
@@ -650,19 +698,22 @@ defmodule EmbedPdf.Font.CFF.Type2 do
 
   # moves
   defp exec(<<21, rest::binary>>, st, ctx, d) do
-    [dx, dy | _] = take_width(st, args(st), 2) ++ [0, 0]
+    {args, st} = take_width(st, args(st), 2)
+    [dx, dy | _] = args ++ [0, 0]
     st = st |> close() |> width_done() |> clear()
     exec(rest, move(st, st.x + dx, st.y + dy), ctx, d)
   end
 
   defp exec(<<22, rest::binary>>, st, ctx, d) do
-    [dx | _] = take_width(st, args(st), 1) ++ [0]
+    {args, st} = take_width(st, args(st), 1)
+    [dx | _] = args ++ [0]
     st = st |> close() |> width_done() |> clear()
     exec(rest, move(st, st.x + dx, st.y), ctx, d)
   end
 
   defp exec(<<4, rest::binary>>, st, ctx, d) do
-    [dy | _] = take_width(st, args(st), 1) ++ [0]
+    {args, st} = take_width(st, args(st), 1)
+    [dy | _] = args ++ [0]
     st = st |> close() |> width_done() |> clear()
     exec(rest, move(st, st.x, st.y + dy), ctx, d)
   end
@@ -737,7 +788,10 @@ defmodule EmbedPdf.Font.CFF.Type2 do
   # endchar
   defp exec(<<14, _rest::binary>>, st, ctx, _d) do
     a = args(st)
-    a = if length(a) in [1, 5] and not st.width?, do: tl(a), else: a
+
+    {a, st} =
+      if length(a) in [1, 5] and not st.width?, do: {tl(a), %{st | width: hd(a)}}, else: {a, st}
+
     st = st |> close() |> width_done() |> clear()
 
     case a do
@@ -860,10 +914,14 @@ defmodule EmbedPdf.Font.CFF.Type2 do
   defp clear(st), do: %{st | stack: [], ops: st.ops + 1}
   defp width_done(st), do: %{st | width?: true}
 
-  # drops the leading width operand when present
-  defp take_width(%{width?: true}, args, _), do: args
-  defp take_width(_st, args, :even), do: if(rem(length(args), 2) == 1, do: tl(args), else: args)
-  defp take_width(_st, args, n), do: if(length(args) > n, do: tl(args), else: args)
+  # drops the leading width operand when present, keeping it in the state
+  defp take_width(%{width?: true} = st, args, _), do: {args, st}
+
+  defp take_width(st, args, :even),
+    do: if(rem(length(args), 2) == 1, do: {tl(args), %{st | width: hd(args)}}, else: {args, st})
+
+  defp take_width(st, args, n),
+    do: if(length(args) > n, do: {tl(args), %{st | width: hd(args)}}, else: {args, st})
 
   defp close(%{open?: true} = st), do: %{st | path: [:close | st.path], open?: false}
   defp close(st), do: st

@@ -870,6 +870,54 @@ defmodule EmbedPdf.Forms do
     doc |> write_value(field, value) |> no_need_appearances()
   end
 
+  @doc false
+  # Gives the text and combo-box widgets on a page that come without an
+  # appearance stream one drawn from the field's value, in the font its
+  # default appearance names (often one embedded in the form's resources).
+  # The renderer calls this so such fields look the same before and after
+  # their first edit.
+  @spec ensure_appearances(Document.t(), non_neg_integer()) :: Document.t()
+  def ensure_appearances(doc, page_index) do
+    page = Document.page(doc, page_index)
+
+    missing =
+      for {:ref, n, _} = ref <- List.wrap(page && Document.get(doc, page.dict, "Annots")),
+          dict = Document.resolve(doc, ref),
+          is_map(dict) and not is_struct(dict),
+          Document.resolve(doc, dict["Subtype"]) == "Widget",
+          not appearance?(doc, dict),
+          do: n
+
+    if missing == [] do
+      doc
+    else
+      doc
+      |> fields()
+      |> Enum.filter(&(&1.type in [:text, :combo]))
+      |> Enum.reduce(doc, fn field, acc ->
+        case Enum.filter(field.widgets, &(&1.id in missing)) do
+          [] ->
+            acc
+
+          widgets ->
+            try do
+              write_value(acc, %{field | widgets: widgets}, field.value)
+            rescue
+              _ -> acc
+            end
+        end
+      end)
+    end
+  end
+
+  defp appearance?(doc, dict) do
+    case Document.get(doc, Document.get(doc, dict, "AP"), "N") do
+      %Stream{} -> true
+      %{} = states -> map_size(states) > 0
+      _ -> false
+    end
+  end
+
   @doc "Removes widget annotations (by id) from the field tree, dropping fields left without widgets."
   @spec remove_widgets(Document.t(), [integer()]) :: Document.t()
   def remove_widgets(doc, ids) do

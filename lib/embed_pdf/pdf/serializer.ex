@@ -15,7 +15,7 @@ defmodule EmbedPdf.PDF.Serializer do
   def serialize(true), do: "true"
   def serialize(false), do: "false"
   def serialize(n) when is_integer(n), do: Integer.to_string(n)
-  def serialize(f) when is_float(f), do: format_real(f)
+  def serialize(f) when is_float(f), do: format_exact(f)
   def serialize({:ref, n, g}), do: [Integer.to_string(n), " ", Integer.to_string(g), " R"]
   def serialize({:string, s}), do: serialize_string(s)
   def serialize({:hex, s}), do: ["<", Base.encode16(s), ">"]
@@ -42,6 +42,32 @@ defmodule EmbedPdf.PDF.Serializer do
   defp sort_key("Type"), do: {0, ""}
   defp sort_key("Subtype"), do: {1, ""}
   defp sort_key(k), do: {2, k}
+
+  @doc """
+  Formats a real number so it reads back as the same value (no exponent).
+  Numbers kept from an opened document are written this way, so a small
+  value such as a Type 3 font matrix entry is not rounded on save.
+  """
+  @spec format_exact(number()) :: String.t()
+  def format_exact(f) when is_integer(f), do: Integer.to_string(f)
+
+  def format_exact(f) do
+    if f == Float.round(f) and abs(f) < 1.0e15 do
+      f |> trunc() |> Integer.to_string()
+    else
+      short = :erlang.float_to_binary(f, [:short])
+
+      case String.split(short, "e") do
+        [plain] ->
+          plain
+
+        [mantissa, exp] ->
+          frac = mantissa |> String.split(".") |> Enum.at(1, "") |> byte_size()
+          decimals = (frac - String.to_integer(exp)) |> max(0) |> min(30)
+          :erlang.float_to_binary(f, decimals: decimals)
+      end
+    end
+  end
 
   @doc "Formats a real number compactly (no exponent)."
   @spec format_real(number()) :: String.t()

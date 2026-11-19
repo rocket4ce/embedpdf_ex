@@ -328,6 +328,47 @@ defmodule EmbedPdf.Font.Type1 do
   end
 
   def glyph(_, _), do: nil
+
+  @doc """
+  The advance width of glyph `name` in text space for size 1, read from the
+  `hsbw`/`sbw` that opens its charstring, or nil.
+  """
+  @spec advance(t(), String.t()) :: float() | nil
+  def advance(%__MODULE__{} = t1, name) when is_binary(name) do
+    with {:ok, encrypted} <- Map.fetch(t1.charstrings, name),
+         wx when is_number(wx) <- side_bearing_width(decrypt_charstring(encrypted, t1.len_iv), []) do
+      [a | _] = t1.matrix
+      wx * a
+    else
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  def advance(_, _), do: nil
+
+  # numbers up to the first operator, which is `hsbw` (sbx wx) or `sbw`
+  # (sbx sby wx wy) in a well-formed charstring; `div` may build an operand
+  defp side_bearing_width(<<13, _::binary>>, [wx, _sbx | _]), do: wx
+  defp side_bearing_width(<<12, 7, _::binary>>, [_wy, wx, _sby, _sbx | _]), do: wx
+
+  defp side_bearing_width(<<12, 12, rest::binary>>, [b, a | stack]) when b != 0,
+    do: side_bearing_width(rest, [a / b | stack])
+
+  defp side_bearing_width(<<255, v::signed-32, rest::binary>>, stack),
+    do: side_bearing_width(rest, [v | stack])
+
+  defp side_bearing_width(<<b, b1, rest::binary>>, stack) when b in 247..250,
+    do: side_bearing_width(rest, [(b - 247) * 256 + b1 + 108 | stack])
+
+  defp side_bearing_width(<<b, b1, rest::binary>>, stack) when b in 251..254,
+    do: side_bearing_width(rest, [-(b - 251) * 256 - b1 - 108 | stack])
+
+  defp side_bearing_width(<<b, rest::binary>>, stack) when b in 32..246,
+    do: side_bearing_width(rest, [b - 139 | stack])
+
+  defp side_bearing_width(_, _), do: nil
 end
 
 defmodule EmbedPdf.Font.Type1.Charstring do

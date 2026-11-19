@@ -336,6 +336,37 @@ defmodule EmbedPdf.Font.Program do
       end
   end
 
+  # ---------------------------------------------------------------- advances
+
+  @doc """
+  The advance width the program gives the glyph of a simple font's `code`,
+  in text space for size 1, or nil. Used when the font dictionary has no
+  `/Widths`.
+  """
+  @spec advance(t() | nil, EmbedPdf.Font.t(), 0..255) :: float() | nil
+  def advance(%__MODULE__{kind: :type1, t1: t1}, font, code) do
+    case EmbedPdf.Font.glyph_name(font, code) || (t1.encoding && Map.get(t1.encoding, code)) do
+      nil -> nil
+      name -> Type1.advance(t1, name) || alternate_name_glyph(name, &Type1.advance(t1, &1))
+    end
+  end
+
+  def advance(%__MODULE__{kind: :cff, cff: cff} = p, font, code) do
+    gid = glyph_id(p, font, {code, code, nil, 0, 1})
+    gid && CFF.advance(cff, gid)
+  end
+
+  def advance(%__MODULE__{tt: %TrueType{} = tt} = p, font, code) do
+    with gid when is_integer(gid) <- glyph_id(p, font, {code, code, nil, 0, 1}),
+         aw when is_integer(aw) <- TrueType.advance(tt, gid) do
+      aw / max(tt.units_per_em, 1)
+    else
+      _ -> nil
+    end
+  end
+
+  def advance(_, _, _), do: nil
+
   # ---------------------------------------------------------------- outlines
 
   @doc "Outline path commands for a decoded glyph (see `EmbedPdf.Font.glyph_outline/2`)."

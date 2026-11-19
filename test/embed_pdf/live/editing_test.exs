@@ -210,4 +210,26 @@ defmodule EmbedPdf.Live.EditingTest do
     assert a(view).name == "links.pdf"
     assert length(a(view).tabs) == 1
   end
+
+  test "undo and redo redraw only the page the step changed" do
+    view = mount_viewer("ebook.pdf")
+    render_click(view, "mode", %{"mode" => "shapes"})
+    render_click(view, "tool", %{"tool" => "square"})
+    send(view.pid, {:embed_pdf, {:pointer, 2, 0.1, 0.1, nil}})
+    send(view.pid, {:embed_pdf, {:pointer, 2, 0.4, 0.3, nil}})
+    render(view)
+
+    before = a(view).page_revs
+    assert [_] = annots(view, 2)
+
+    render_click(view, "undo", %{})
+    assert annots(view, 2) == []
+    undone = a(view).page_revs
+    assert undone[2] > before[2]
+    assert Map.delete(undone, 2) == Map.delete(before, 2)
+
+    render_click(view, "redo", %{})
+    assert [_] = annots(view, 2)
+    assert Map.delete(a(view).page_revs, 2) == Map.delete(before, 2)
+  end
 end

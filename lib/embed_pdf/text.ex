@@ -78,7 +78,7 @@ defmodule EmbedPdf.Text do
 
       [
         %{
-          text: uni,
+          text: expand_ligatures(uni),
           box: box,
           origin: {e, f},
           dir: {a / max(xlen, 1.0e-9), b / max(xlen, 1.0e-9)},
@@ -89,6 +89,24 @@ defmodule EmbedPdf.Text do
         }
       ]
     end
+  end
+
+  # Latin ligature glyphs read as their letters, as PDFium does, so that
+  # searching "first" finds a word set with the "fi" ligature.
+  @ligatures %{
+    "\uFB00" => "ff",
+    "\uFB01" => "fi",
+    "\uFB02" => "fl",
+    "\uFB03" => "ffi",
+    "\uFB04" => "ffl",
+    "\uFB05" => "st",
+    "\uFB06" => "st"
+  }
+
+  defp expand_ligatures(text) do
+    if String.contains?(text, Map.keys(@ligatures)),
+      do: String.replace(text, Map.keys(@ligatures), &Map.fetch!(@ligatures, &1)),
+      else: text
   end
 
   # ---------------------------------------------------------------- layout
@@ -389,7 +407,14 @@ defmodule EmbedPdf.Text do
       graphemes = pt.chars |> Tuple.to_list() |> Enum.map(&normalize_char(&1.text))
       haystack = Enum.join(graphemes)
       offsets = grapheme_offsets(graphemes)
-      pattern = query |> normalize_space() |> Regex.escape() |> String.replace("\\ ", "\\s+")
+      pattern =
+        query
+        |> expand_ligatures()
+        |> String.graphemes()
+        |> Enum.map_join(&normalize_char/1)
+        |> normalize_space()
+        |> Regex.escape()
+        |> String.replace("\\ ", "\\s+")
 
       pattern =
         if whole, do: "(?<![\\p{L}\\p{N}])" <> pattern <> "(?![\\p{L}\\p{N}])", else: pattern
@@ -418,6 +443,9 @@ defmodule EmbedPdf.Text do
 
   defp normalize_char("\n"), do: " "
   defp normalize_char(" "), do: " "
+  # typographic quotes match the ones on a keyboard
+  defp normalize_char(t) when t in ["\u2018", "\u2019", "\u02BC", "\u201B", "\u2032"], do: "'"
+  defp normalize_char(t) when t in ["\u201C", "\u201D", "\u201F", "\u2033"], do: "\""
   defp normalize_char(t), do: t
 
   defp normalize_space(s), do: String.replace(s, ~r/\s+/u, " ")

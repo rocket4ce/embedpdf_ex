@@ -1569,7 +1569,9 @@ defmodule EmbedPdf.Live.Viewer do
         list -> Enum.reduce(list, a.page_revs, &Map.put(&2, &1, rev))
       end
 
-    undo = Enum.take([a.doc | a.history.undo], @history_limit)
+    # each step remembers what it touched, so undoing it redraws only that
+    step = {a.doc, pages, opts[:text] == true}
+    undo = Enum.take([step | a.history.undo], @history_limit)
 
     socket
     |> assign(
@@ -1611,39 +1613,45 @@ defmodule EmbedPdf.Live.Viewer do
     |> reload_loaded()
   end
 
-  defp undo(%{assigns: %{history: %{undo: [prev | rest]}}} = socket) do
+  defp undo(%{assigns: %{history: %{undo: [{prev, pages, text?} | rest]}}} = socket) do
     a = socket.assigns
-    rev = Store.update(a.doc_id, prev)
 
-    socket
-    |> assign(
-      doc: prev,
-      rev: rev,
-      page_revs: Map.new(0..(length(prev.pages) - 1)//1, &{&1, rev}),
-      history: %{undo: rest, redo: [a.doc | a.history.redo]},
-      selected: nil
-    )
-    |> after_change(:all, text: true)
+    restore(socket, prev, pages, text?, %{
+      undo: rest,
+      redo: [{a.doc, pages, text?} | a.history.redo]
+    })
   end
 
   defp undo(socket), do: socket
 
-  defp redo(%{assigns: %{history: %{redo: [next | rest]}}} = socket) do
+  defp redo(%{assigns: %{history: %{redo: [{next, pages, text?} | rest]}}} = socket) do
     a = socket.assigns
-    rev = Store.update(a.doc_id, next)
 
-    socket
-    |> assign(
-      doc: next,
-      rev: rev,
-      page_revs: Map.new(0..(length(next.pages) - 1)//1, &{&1, rev}),
-      history: %{undo: [a.doc | a.history.undo], redo: rest},
-      selected: nil
-    )
-    |> after_change(:all, text: true)
+    restore(socket, next, pages, text?, %{
+      undo: [{a.doc, pages, text?} | a.history.undo],
+      redo: rest
+    })
   end
 
   defp redo(socket), do: socket
+
+  # puts back `doc`, a step away in the history; `pages` is what that step touched
+  defp restore(socket, doc, pages, text?, history) do
+    a = socket.assigns
+    rev = Store.update(a.doc_id, doc)
+    last = length(doc.pages) - 1
+    pages = if length(doc.pages) != length(a.sizes), do: :all, else: pages
+
+    page_revs =
+      case pages do
+        list when is_list(list) -> Enum.reduce(list, a.page_revs, &Map.put(&2, &1, rev))
+        _ -> Map.new(0..last//1, &{&1, rev})
+      end
+
+    socket
+    |> assign(doc: doc, rev: rev, page_revs: page_revs, history: history, selected: nil)
+    |> after_change(pages, text: text?)
+  end
 
   defp normalize_doc({doc, _}), do: doc
   defp normalize_doc(doc), do: doc

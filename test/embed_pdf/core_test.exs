@@ -115,5 +115,47 @@ defmodule EmbedPdf.CoreTest do
       assert EmbedPdf.Text.search(pt, "pdf") != []
       assert EmbedPdf.Text.search(pt, "integ", whole_word: true) == []
     end
+
+    test "ligature glyphs read as their letters" do
+      doc = open!("demo_protected.pdf", password: "embedpdf")
+      text = EmbedPdf.text(doc, 0)
+      refute text =~ "\uFB01"
+      assert text =~ "identifies"
+      assert length(EmbedPdf.search(doc, "efficient")) == 18
+      assert EmbedPdf.search(doc, "e\uFB03cient") == EmbedPdf.search(doc, "efficient")
+    end
+
+    test "typographic and keyboard quotes match each other" do
+      pt = EmbedPdf.Text.page(open!("ebook-annotated.pdf"), 0)
+      assert [%{text: found}] = EmbedPdf.Text.search(pt, "don't have")
+      assert found =~ "Don"
+      assert EmbedPdf.Text.search(pt, "don\u2019t have") != []
+    end
+  end
+
+  describe "saving" do
+    test "small real numbers keep their value" do
+      alias EmbedPdf.PDF.Serializer
+
+      assert Serializer.serialize(4.8828125e-4) |> IO.iodata_to_binary() == "0.00048828125"
+      assert Serializer.serialize(-4.8828125e-4) |> IO.iodata_to_binary() == "-0.00048828125"
+      assert Serializer.serialize(0.23999999) |> IO.iodata_to_binary() == "0.23999999"
+      assert Serializer.serialize(3.0) |> IO.iodata_to_binary() == "3"
+
+      assert Serializer.serialize(1.0e-7) |> IO.iodata_to_binary() |> Float.parse() ==
+               {1.0e-7, ""}
+    end
+
+    test "a Type 3 font matrix survives a save" do
+      doc = open!("ebook-annotated.pdf")
+      {:ok, again} = EmbedPdf.open(EmbedPdf.save(doc))
+
+      matrices = fn d ->
+        for {_n, %{"Subtype" => "Type3", "FontMatrix" => m}} <- d.objects, do: m
+      end
+
+      assert matrices.(doc) != []
+      assert Enum.sort(matrices.(again)) == Enum.sort(matrices.(doc))
+    end
   end
 end

@@ -102,4 +102,46 @@ defmodule EmbedPdf.FormsTest do
     text = Enum.find(Forms.fields(again), &(&1.type == :text))
     assert text.value == "Value for #{text.name}"
   end
+
+  test "fonts embedded for a form without /Widths take their advances from the program" do
+    doc = open!("kept_fonts_form.pdf")
+    dr = Document.get(doc, Document.get(doc, Document.catalog(doc), "AcroForm"), "DR")
+    fonts = Document.get(doc, dr, "Font")
+
+    # a fixed-pitch CFF font: every glyph is 600 units wide
+    fixed = EmbedPdf.Font.load(doc, fonts["FCff"])
+    assert map_size(fixed.widths) > 90
+    assert fixed.widths |> Map.values() |> Enum.uniq() == [0.6]
+
+    # a Type 1 subset: widths come from each charstring's hsbw
+    roboto = EmbedPdf.Font.load(doc, fonts["FT1"])
+    assert_in_delta roboto.widths[?H], 0.734, 0.001
+    assert_in_delta roboto.widths[?,], 0.202, 0.001
+  end
+
+  test "fields saved without an appearance are drawn in the font their form names" do
+    doc = open!("kept_fonts_form.pdf")
+    refute Enum.any?(Forms.fields(doc), fn f -> Enum.any?(f.widgets, & &1.on_state) end)
+
+    with_ap = Forms.ensure_appearances(doc, 0)
+
+    for field <- Forms.fields(with_ap), widget <- field.widgets do
+      dict = Document.resolve(with_ap, {:ref, widget.id, 0})
+      ap = Document.get(with_ap, Document.get(with_ap, dict, "AP"), "N")
+      content = Document.stream_data(with_ap, ap)
+      assert content =~ ~r{/(FCff|FT1) [\d.]+ Tf}
+    end
+
+    # the page image uses those outlines rather than a stand-in in Helvetica
+    svg = doc |> EmbedPdf.render_svg(0) |> IO.iodata_to_binary()
+    refute svg =~ "<text"
+    assert svg =~ "<path" or svg =~ "<use"
+
+    # the saved file still leaves those appearances to its reader
+    {:ok, again} = EmbedPdf.open(EmbedPdf.save(doc))
+
+    for field <- Forms.fields(again), widget <- field.widgets do
+      refute Map.has_key?(Document.resolve(again, {:ref, widget.id, 0}), "AP")
+    end
+  end
 end
