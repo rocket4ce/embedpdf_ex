@@ -107,6 +107,9 @@ defmodule EmbedPdf.Live.Viewer do
         measure_scale: %{factor: 25.4 / 72, unit: "mm"},
         flash_msg: nil,
         pending_password: nil,
+        signatures: nil,
+        signature_text: "",
+        signing: nil,
         tabs: [],
         tab_state: %{},
         parent: socket.parent_pid
@@ -181,7 +184,8 @@ defmodule EmbedPdf.Live.Viewer do
   defp open_bytes(socket, bytes, name, password) do
     case EmbedPdf.open(bytes, password: password || "") do
       {:ok, doc} ->
-        use_doc(socket, doc, name, nil)
+        id = Store.put(doc, name: name, meta: EmbedPdf.Output.original_meta(bytes, doc))
+        use_doc(socket, doc, name, id)
 
       {:error, reason} when reason in [:password_required, :bad_password] ->
         assign(socket,
@@ -229,9 +233,36 @@ defmodule EmbedPdf.Live.Viewer do
       search: %{socket.assigns.search | hits: [], current: nil},
       dialog: nil,
       pending_password: nil,
-      tabs: tabs
+      tabs: tabs,
+      signatures: nil,
+      signing: nil
     )
+    |> load_signatures()
   end
+
+  # validation of the document's signatures, from the bytes it would be saved as
+  defp load_signatures(%{assigns: %{doc_id: id}} = socket) when is_binary(id) do
+    if socket.assigns.features["signatures.checking"] do
+      entry = Store.get(id)
+
+      results =
+        if entry && entry.meta[:signed?] do
+          try do
+            entry |> EmbedPdf.Output.bytes() |> EmbedPdf.Signatures.validate()
+          rescue
+            _ -> []
+          end
+        else
+          []
+        end
+
+      assign(socket, signatures: results)
+    else
+      assign(socket, signatures: [])
+    end
+  end
+
+  defp load_signatures(socket), do: socket
 
   # remembers the open document's history and position before another tab takes over
   defp stash_tab(%{assigns: %{doc_id: nil}} = socket), do: socket
@@ -982,6 +1013,35 @@ defmodule EmbedPdf.Live.Viewer do
 
   def handle_event("snapshot_close", _, socket), do: {:noreply, assign(socket, snapshot: nil)}
 
+  # ---------------------------------------------------------------- signatures
+
+  def handle_event("signature_text", %{"text" => text}, socket),
+    do: {:noreply, assign(socket, signature_text: String.slice(text, 0, 80))}
+
+  def handle_event("sign_field", %{"field" => field}, socket),
+    do: {:noreply, assign(socket, signing: parse_int(field, 0), dialog: :sign)}
+
+  def handle_event("sign", %{"name" => name, "how" => how} = params, socket) do
+    a = socket.assigns
+    name = String.trim(name)
+    mark = {:text, if(name == "", do: "Signed", else: name), date: true}
+
+    case {how, a.signing} do
+      {"visual", field} when is_integer(field) ->
+        doc = EmbedPdf.Signatures.fill_visual(a.doc, field, mark)
+        socket = if is_map(doc), do: commit(socket, doc, :all), else: socket
+
+        {:noreply,
+         assign(socket, dialog: nil, signing: nil, signature_text: name) |> refresh_lists()}
+
+      {"seal", field} when is_integer(field) ->
+        {:noreply, seal(socket, field, mark, params)}
+
+      _ ->
+        {:noreply, assign(socket, dialog: nil, signing: nil)}
+    end
+  end
+
   # the measured distance is worth `length` `unit`: derive the scale from it
   def handle_event("calibrate", %{"length" => length, "unit" => unit}, socket) do
     case {socket.assigns.measure, parse_float(length, 0.0)} do
@@ -1136,7 +1196,7 @@ defmodule EmbedPdf.Live.Viewer do
       a.moving? and a.selected ->
         move_selected_to(socket, page, point)
 
-      a.tool in [:note, :stamp, :free_text] ->
+      a.tool in [:note, :stamp, :free_text, :signature] ->
         place(socket, page, point)
 
       a.tool in [
@@ -1148,7 +1208,8 @@ defmodule EmbedPdf.Live.Viewer do
         :snapshot,
         :zoom_area,
         :link,
-        :measure
+        :measure,
+        :signature
       ] ->
         two_points(socket, page, point)
 
@@ -1249,6 +1310,24 @@ defmodule EmbedPdf.Live.Viewer do
           })
 
         assign(socket, right: :comments) |> refresh_lists()
+
+      :signature ->
+        text = socket.assigns.signature_text
+        text = if String.trim(text) == "", do: "Signed", else: text
+        rect = user_rect(socket, page, {x - 90, y - 28}, {x + 90, y + 28})
+
+        {doc, annot} =
+          EmbedPdf.Signatures.place_mark(
+            socket.assigns.doc,
+            page,
+            rect,
+            {:text, text, date: true}
+          )
+
+        socket
+        |> commit(doc, [page])
+        |> assign(points: [], selected: {page, annot.id})
+        |> refresh_lists()
 
       :stamp ->
         rect = user_rect(socket, page, {x - 80, y - 25}, {x + 80, y + 25})
@@ -1765,6 +1844,40 @@ defmodule EmbedPdf.Live.Viewer do
     end
   end
 
+  # Seals a signature field through the signer the host configured
+  # (`config :embedpdf_ex, signer: ...`, see EmbedPdf.Signatures.sign/3).
+  # The signed file is reopened in place of the current one.
+  defp seal(socket, field, mark, params) do
+    a = socket.assigns
+
+    with signer when signer != nil <- signer(),
+         %Store.Entry{} = entry <- Store.get(a.doc_id),
+         {:ok, signed} <-
+           EmbedPdf.Signatures.sign(EmbedPdf.Output.bytes(entry), field,
+             signer: signer,
+             mark: mark,
+             reason: blank_nil(params["reason"]),
+             location: blank_nil(params["location"])
+           ),
+         {:ok, doc} <- EmbedPdf.open(signed) do
+      old = a.doc_id
+      id = Store.put(doc, name: a.name, meta: EmbedPdf.Output.original_meta(signed, doc))
+
+      socket
+      |> assign(tabs: Enum.reject(a.tabs, &(&1.id == old)), doc_id: nil)
+      |> use_doc(doc, a.name, id)
+      |> assign(right: :signatures)
+    else
+      _ -> assign(socket, dialog: nil, signing: nil, flash_msg: "signature.failed")
+    end
+  end
+
+  @doc false
+  def signer, do: Application.get_env(:embedpdf_ex, :signer)
+
+  defp blank_nil(nil), do: nil
+  defp blank_nil(s), do: if(String.trim(s) == "", do: nil, else: s)
+
   @doc false
   def measure_label(%{factor: f, unit: unit}, points) do
     value = points * f
@@ -1783,7 +1896,13 @@ defmodule EmbedPdf.Live.Viewer do
         field_action: nil
       )
 
-  defp refresh_lists(socket) do
+  defp refresh_lists(%{assigns: %{right: :signatures, status: :ready}} = socket) do
+    socket |> load_signatures() |> assign(right: :signatures) |> refresh_other_lists()
+  end
+
+  defp refresh_lists(socket), do: refresh_other_lists(socket)
+
+  defp refresh_other_lists(socket) do
     a = socket.assigns
 
     if a.status != :ready do

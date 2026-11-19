@@ -75,17 +75,7 @@ defmodule EmbedPdf.Web.Plug do
   defp route(conn, ["d", doc, "download"]) do
     case Store.get(doc) do
       %Store.Entry{} = entry ->
-        doc_value =
-          if conn.params["flatten"] == "1" and Code.ensure_loaded?(EmbedPdf.Writer) and
-               function_exported?(EmbedPdf.Writer, :flatten_annotations, 2),
-             do: EmbedPdf.Writer.flatten_annotations(entry.doc, :all),
-             else: entry.doc
-
-        bytes =
-          if Code.ensure_loaded?(EmbedPdf.Writer) and
-               function_exported?(EmbedPdf.Writer, :save, 2),
-             do: EmbedPdf.Writer.save(doc_value, []),
-             else: EmbedPdf.save(doc_value)
+        bytes = EmbedPdf.Output.bytes(entry, flatten: conn.params["flatten"] == "1")
 
         disposition = if conn.params["inline"] == "1", do: "inline", else: "attachment"
 

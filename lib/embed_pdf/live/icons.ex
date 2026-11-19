@@ -63,6 +63,7 @@ defmodule EmbedPdf.Live.Icons do
     "keyboard" => "M3 6h18v12H3zM7 10h.01M11 10h.01M15 10h.01M7 14h10",
     "bookmark" => "M7 4h10v16l-5-4-5 4z",
     "resize" => "M14 4h6v6M10 20H4v-6M20 4l-7 7M4 20l7-7",
+    "signature" => "M3 16c2.5-5 4.5-5.5 5.5-2s2.5 3.5 4.5-2.5 3-4.5 4-.5 2 3.5 4 2.5M3 20h18",
     "move" => "M12 3v18M3 12h18M9 6l3-3 3 3M9 18l3 3 3-3M6 9l-3 3 3 3M18 9l3 3-3 3",
     "thumbnails" => "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z",
     "outline" => "M9 6h11M9 12h11M9 18h11M5 6h.01M5 12h.01M5 18h.01",

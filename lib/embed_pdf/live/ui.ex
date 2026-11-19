@@ -39,6 +39,7 @@ defmodule EmbedPdf.Live.UI do
       <.doc_tabs :if={@f["documents.tabs"] and length(@tabs) > 1} {assigns} />
       <.modebar :if={@status == :ready and @mode != :view} {assigns} />
       <.hint {assigns} />
+      <.signature_banner :if={@status == :ready and is_list(@signatures) and @signatures != []} {assigns} />
 
       <div class="epdf-body">
         <.left_panel :if={@left && @status == :ready} {assigns} />
@@ -193,6 +194,17 @@ defmodule EmbedPdf.Live.UI do
         <button :if={@f["snapshots"]} class={["epdf-btn", @tool == :snapshot && "is-active"]} phx-click="tool" phx-value-tool="snapshot" title={t(assigns, "tool.snapshot")} aria-label={t(assigns, "tool.snapshot")}>
           <.icon name="camera" />
         </button>
+        <button
+          :if={@f["signatures"]}
+          class={["epdf-btn", @right == :signatures && "is-active"]}
+          phx-click="panel"
+          phx-value-side="right"
+          phx-value-panel="signatures"
+          title={t(assigns, "panel.signatures")}
+          aria-label={t(assigns, "panel.signatures")}
+        >
+          <.icon name="signature" />
+        </button>
         <button :if={@f["search"]} class={["epdf-btn", @right == :search && "is-active"]} phx-click="panel" phx-value-side="right" phx-value-panel="search" title={t(assigns, "panel.search")} aria-label={t(assigns, "panel.search")}>
           <.icon name="search" />
         </button>
@@ -266,6 +278,25 @@ defmodule EmbedPdf.Live.UI do
           </div>
         </div>
 
+        <button
+          :if={@mode == :insert and @f["signatures.signing"]}
+          class={["epdf-btn", @tool == :signature && "is-active"]}
+          phx-click="tool"
+          phx-value-tool="signature"
+          title={t(assigns, "tool.signature")}
+          aria-label={t(assigns, "tool.signature")}
+        >
+          <.icon name="signature" />
+        </button>
+        <form
+          :if={@mode == :insert and @tool == :signature}
+          id={"#{@viewer_id}-signature-text"}
+          class="epdf-inline-form epdf-signature-text"
+          phx-change="signature_text"
+          phx-submit="noop"
+        >
+          <input type="text" name="text" value={@signature_text} placeholder={t(assigns, "signature.your_name")} phx-debounce="300" />
+        </form>
         <label :if={@mode == :insert and @f["attachments.adding"]} class="epdf-btn" for={@uploads.attachment.ref} title={t(assigns, "tool.attachment")}>
           <.icon name="paperclip" />
         </label>
@@ -434,7 +465,7 @@ defmodule EmbedPdf.Live.UI do
       a.tool in [:square, :circle, :redact_area, :link] -> "hint.two_points"
       a.tool in [:line, :arrow, :measure] -> "hint.line"
       a.tool in [:ink, :polygon, :polyline] -> "hint.points"
-      a.tool in [:note, :stamp, :free_text] -> "hint.place"
+      a.tool in [:note, :stamp, :free_text, :signature] -> "hint.place"
       a.tool == :snapshot -> "hint.snapshot"
       a.tool == :zoom_area -> "hint.zoom"
       true -> nil
@@ -671,6 +702,7 @@ defmodule EmbedPdf.Live.UI do
         <.comments_panel :if={@right == :comments} {assigns} />
         <.annotation_panel :if={@right == :annotation} {assigns} />
         <.redact_panel :if={@right == :redact} {assigns} />
+        <.signatures_panel :if={@right == :signatures} {assigns} />
         <EmbedPdf.Live.FormDesign.panel :if={@right == :field} {assigns} />
       </div>
     </aside>
@@ -681,6 +713,7 @@ defmodule EmbedPdf.Live.UI do
   defp panel_title(:comments), do: "panel.comments"
   defp panel_title(:annotation), do: "annotation.properties"
   defp panel_title(:redact), do: "redact.pending"
+  defp panel_title(:signatures), do: "panel.signatures"
   defp panel_title(:field), do: "field.properties"
   defp panel_title(_), do: "panel.sidebar"
 
@@ -803,6 +836,90 @@ defmodule EmbedPdf.Live.UI do
     """
   end
 
+  defp signature_banner(assigns) do
+    valid = Enum.count(assigns.signatures, &(&1.status == :valid))
+    assigns = assign(assigns, valid: valid, total: length(assigns.signatures))
+
+    ~H"""
+    <div class={["epdf-sigbar", @valid == @total && "is-valid", @valid < @total && "is-invalid"]} role="status">
+      <.icon name="signature" />
+      <span>
+        {if @valid == @total,
+          do: t(assigns, "signature.banner_valid", %{count: @total}),
+          else: t(assigns, "signature.banner_problem", %{count: @total - @valid})}
+      </span>
+      <button class="epdf-btn epdf-btn-text" phx-click="panel" phx-value-side="right" phx-value-panel="signatures">{t(assigns, "signature.details")}</button>
+    </div>
+    """
+  end
+
+  defp signatures_panel(assigns) do
+    fields =
+      try do
+        assigns.doc |> EmbedPdf.Signatures.fields() |> Enum.reject(& &1.signed?)
+      rescue
+        _ -> []
+      end
+
+    assigns = assign(assigns, unsigned: fields)
+
+    ~H"""
+    <p :if={@signatures == [] and @unsigned == []} class="epdf-muted">{t(assigns, "signature.none")}</p>
+    <div :for={sig <- @signatures || []} class={["epdf-comment", "epdf-sig", "is-#{sig.status}"]}>
+      <div class="epdf-sig-head">
+        <span class="epdf-sig-status">{t(assigns, "signature.status.#{sig.status}")}</span>
+        <strong>{sig.signer || sig.field || "—"}</strong>
+      </div>
+      <dl class="epdf-dl">
+        <dt :if={sig.signed_at}>{t(assigns, "signature.signed_at")}</dt>
+        <dd :if={sig.signed_at}>{Calendar.strftime(sig.signed_at, "%Y-%m-%d %H:%M UTC")}</dd>
+        <dt :if={sig.reason}>{t(assigns, "signature.reason")}</dt>
+        <dd :if={sig.reason}>{sig.reason}</dd>
+        <dt :if={sig.location}>{t(assigns, "signature.location")}</dt>
+        <dd :if={sig.location}>{sig.location}</dd>
+        <dt>{t(assigns, "signature.integrity")}</dt>
+        <dd>{if sig.digest_ok? and sig.signature_ok?, do: t(assigns, "signature.intact"), else: t(assigns, "signature.broken")}</dd>
+        <dt>{t(assigns, "signature.coverage")}</dt>
+        <dd>{if sig.covers_whole_document?, do: t(assigns, "signature.whole"), else: t(assigns, "signature.partial")}</dd>
+        <dt :if={sig.certificate}>{t(assigns, "signature.issuer")}</dt>
+        <dd :if={sig.certificate}>{sig.certificate.issuer}{if sig.certificate.self_signed?, do: " · " <> t(assigns, "signature.self_signed")}</dd>
+      </dl>
+      <p :for={e <- sig.errors || []} class="epdf-error">{e}</p>
+    </div>
+    <div :if={@unsigned != []} class="epdf-sig-fields">
+      <div class="epdf-result-page">{t(assigns, "signature.fields")}</div>
+      <div :for={f <- @unsigned} class="epdf-attachment">
+        <.icon name="signature" />
+        <div class="epdf-attachment-info">
+          <strong>{f.name}</strong>
+          <span class="epdf-muted">{t(assigns, "comments.page", %{page: (f.page || 0) + 1})}{if f.filled?, do: " · " <> t(assigns, "signature.filled")}</span>
+        </div>
+        <button :if={@f["signatures.signing"]} class="epdf-btn epdf-btn-text epdf-primary" phx-click="sign_field" phx-value-field={f.id}>{t(assigns, "signature.sign")}</button>
+      </div>
+    </div>
+    """
+  end
+
+  defp sign_dialog(assigns) do
+    assigns = assign(assigns, can_seal?: Viewer.signer() != nil)
+
+    ~H"""
+    <h3>{t(assigns, "signature.sign")}</h3>
+    <form id={"#{@viewer_id}-sign"} phx-submit="sign" class="epdf-column">
+      <label class="epdf-field">{t(assigns, "signature.your_name")}
+        <input type="text" name="name" value={@signature_text} required phx-mounted={JS.focus()} />
+      </label>
+      <label :if={@can_seal?} class="epdf-field">{t(assigns, "signature.reason")}<input type="text" name="reason" /></label>
+      <label :if={@can_seal?} class="epdf-field">{t(assigns, "signature.location")}<input type="text" name="location" /></label>
+      <p class="epdf-muted">{if @can_seal?, do: t(assigns, "signature.seal_text"), else: t(assigns, "signature.visual_text")}</p>
+      <div class="epdf-dialog-actions">
+        <button class="epdf-btn epdf-btn-text" type="submit" name="how" value="visual">{t(assigns, "signature.fill")}</button>
+        <button :if={@can_seal?} class="epdf-btn epdf-btn-text epdf-primary" type="submit" name="how" value="seal">{t(assigns, "signature.seal")}</button>
+      </div>
+    </form>
+    """
+  end
+
   defp redact_panel(assigns) do
     marks =
       for p <- 0..(length(assigns.sizes) - 1)//1,
@@ -848,6 +965,8 @@ defmodule EmbedPdf.Live.UI do
             <.password_dialog {assigns} />
           <% @dialog == :link -> %>
             <.link_dialog {assigns} />
+          <% @dialog == :sign -> %>
+            <.sign_dialog {assigns} />
           <% @dialog == :calibrate -> %>
             <h3>{t(assigns, "measure.calibrate")}</h3>
             <p class="epdf-muted">{t(assigns, "measure.calibrate_text")}</p>
