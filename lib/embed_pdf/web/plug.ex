@@ -180,6 +180,39 @@ defmodule EmbedPdf.Web.Plug do
     _ -> gif(conn)
   end
 
+  defp route(conn, ["seen", viewer, count, file]) do
+    with {count, ""} <- Integer.parse(count),
+         true <- count >= 0 and count <= 20_000 do
+      conn
+      |> put_resp_content_type("text/css")
+      |> put_resp_header("cache-control", "private, max-age=86400")
+      |> send_resp(
+        200,
+        EmbedPdf.Live.Probe.seen_css(
+          base_path(conn),
+          viewer,
+          count,
+          String.trim_trailing(file, ".css")
+        )
+      )
+      |> halt()
+    else
+      _ -> not_found(conn)
+    end
+  end
+
+  defp route(conn, ["seen"]) do
+    p = conn.params
+
+    with viewer when is_binary(viewer) <- p["v"],
+         page when is_integer(page) <- int(p["p"]),
+         nonce when is_integer(nonce) <- int(p["n"]) do
+      notify(viewer, {:seen, page, nonce})
+    end
+
+    gif(conn)
+  end
+
   defp route(conn, ["pointer"]) do
     p = conn.params
 
@@ -199,7 +232,7 @@ defmodule EmbedPdf.Web.Plug do
   defp route(conn, ["assets", "viewer.css"]) do
     conn
     |> put_resp_content_type("text/css")
-    |> put_resp_header("cache-control", "public, max-age=3600")
+    |> put_resp_header("cache-control", "public, max-age=31536000, immutable")
     |> send_resp(200, EmbedPdf.Live.CSS.css())
     |> halt()
   end

@@ -143,3 +143,31 @@ defmodule Floki_like do
   @moduledoc false
   def pages(html), do: Regex.scan(~r/class="epdf-page[ "]/, html)
 end
+
+defmodule EmbedPdf.Live.ScrollTrackingTest do
+  use ExUnit.Case, async: true
+
+  import Phoenix.ConnTest
+  import Phoenix.LiveViewTest
+  import EmbedPdf.TestHelpers
+
+  @endpoint EmbedPdf.TestEndpoint
+
+  test "middle-of-viewport reports move the current page and bump the stylesheet" do
+    {:ok, view, _} =
+      live_isolated(build_conn(), EmbedPdf.Live.Viewer,
+        session: %{"path" => fixture("links.pdf")}
+      )
+
+    a = fn -> :sys.get_state(view.pid).socket.assigns end
+    send(view.pid, {:embed_pdf, {:seen, 2, 1}})
+    html = render(view)
+    assert a.().current_page == 2
+    assert a.().seen.nonce == 2
+    assert html =~ "/4/2.css"
+    # stale nonce is ignored
+    send(view.pid, {:embed_pdf, {:seen, 3, 1}})
+    render(view)
+    assert a.().current_page == 2
+  end
+end

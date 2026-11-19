@@ -70,6 +70,7 @@ information from standard browser behavior instead:
 | --- | --- |
 | Viewport size (fit width, fit page) | The viewport is a CSS size container. A generated stylesheet holds one container query per 16 px bucket, each giving a hidden probe a different `background-image` URL. The browser fetches only the matching URL, which tells the server the size. |
 | Click position on a page (notes, shapes, ink, stamps, snapshots, measuring) | In point tools each page carries a plain `<form>` with an `<input type="image">`. Browsers submit the click coordinates; the form posts into a hidden iframe and the server answers `204`, so the page does not navigate and no history entry is added. |
+| Current page while scrolling | Each page holds invisible markers driven by a CSS scroll-driven animation (`animation-timeline: view()`). A marker only gets its `background-image`, a per-page URL, while it crosses the middle of the viewport, so the browser fetches that URL as the page passes the center. Browsers without scroll timelines (Firefox, for now) update the page on navigation, clicks and page loads instead. |
 | Lazy page loading | Pages are `<img loading="lazy">` SVGs. Each image request tells the viewer that the page is near the screen, which then loads that page's text layer and annotations. |
 | Text selection and copy | A transparent text layer over each page, positioned in percentages and stretched to the PDF's line widths, so native selection and copy work. |
 | Scrolling to a page or search hit | A hidden anchor rendered with `phx-mounted={JS.dispatch("click")}` follows a `#fragment` link. |
@@ -85,8 +86,8 @@ Some interactions cannot be identical without JavaScript:
   ink and polygons by clicking points then **Finish**, and annotations move with
   **Move** plus a click, nudge buttons or arrow keys. Text markup is made by clicking
   the first and last word.
-- **Current page while scrolling**: the page indicator updates on navigation, clicks
-  and page loads, but not continuously while you scroll.
+- **Current page while scrolling** needs CSS scroll-driven animations (Chrome, Edge,
+  Safari 26+). Elsewhere the indicator updates on navigation, clicks and page loads.
 - **Shortcuts with modifier keys** (Ctrl+Z, Ctrl+F…) are not detectable, since LiveView
   sends only the key. The viewer uses plain keys (`+`, `-`, `←`, `→`, `Home`, `End`,
   `r`, `h`, `f`, `?`, `Esc`, `Delete`).

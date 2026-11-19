@@ -109,11 +109,21 @@ defmodule EmbedPdf.Live.CSS do
   .epdf-scroll-horizontal .epdf-pages{flex-direction:row;align-items:center;min-height:100%;width:max-content}
   .epdf-scroll-paged .epdf-pages{justify-content:center}
   .epdf-row{display:flex;gap:var(--epdf-gap);align-items:center}
-  .epdf-page{position:relative;flex:none;background:#fff;box-shadow:var(--epdf-shadow);overflow:hidden;scroll-margin:var(--epdf-gap);user-select:none}
+  .epdf-page{position:relative;flex:none;background:#fff;box-shadow:var(--epdf-shadow);overflow:hidden;overflow:clip;scroll-margin:var(--epdf-gap);user-select:none}
   .epdf-page.is-selected{outline:3px solid var(--epdf-accent);outline-offset:2px}
   .epdf-page-img{position:absolute;inset:0;width:100%;height:100%;display:block;pointer-events:none}
   .epdf-page-number{position:absolute;bottom:4px;right:6px;font-size:11px;color:#888;background:rgba(255,255,255,.8);padding:0 4px;border-radius:3px;pointer-events:none;opacity:0;transition:opacity .2s}
   .epdf-page:hover .epdf-page-number{opacity:1}
+
+  /* scroll position: a marker's background URL applies only while it crosses the
+     middle of the viewport, so the browser fetches it then (scroll-driven animation) */
+  .epdf-seen{position:absolute;left:0;width:1px;height:1px;opacity:0;pointer-events:none;background-size:1px 1px;
+    animation-name:epdf-seen;animation-duration:auto;animation-timing-function:linear;animation-fill-mode:both;animation-timeline:view()}
+  .epdf-seen-1{top:16%}.epdf-seen-2{top:50%}.epdf-seen-3{top:84%}
+  .epdf-scroll-horizontal .epdf-seen{animation-timeline:view(inline);top:50%}
+  .epdf-scroll-horizontal .epdf-seen-1{left:16%}.epdf-scroll-horizontal .epdf-seen-2{left:50%}.epdf-scroll-horizontal .epdf-seen-3{left:84%}
+  .epdf-scroll-paged .epdf-seen{display:none}
+  @keyframes epdf-seen{0%,38%{background-image:none}39%,61%{background-image:var(--epdf-seen)}62%,100%{background-image:none}}
 
   /* text layer */
   .epdf-text-layer{position:absolute;inset:0;overflow:hidden;line-height:1;color:transparent;white-space:pre;user-select:text;-webkit-user-select:text;cursor:text;z-index:1}
@@ -238,6 +248,11 @@ defmodule EmbedPdf.Live.CSS do
   @media print{.epdf-topbar,.epdf-modebar,.epdf-hint,.epdf-panel,.epdf-pager{display:none!important}.epdf-viewport{overflow:visible}}
   """
 
+  @version @css |> :erlang.md5() |> Base.url_encode64(padding: false) |> binary_part(0, 10)
+
   @doc "The stylesheet."
   def css, do: @css
+
+  @doc "A hash of the stylesheet, used in its URL so browsers never keep a stale copy."
+  def version, do: @version
 end

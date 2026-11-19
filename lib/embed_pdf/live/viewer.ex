@@ -62,6 +62,7 @@ defmodule EmbedPdf.Live.Viewer do
         dirty?: false,
         container: {1000, 800},
         probe_nonce: 1,
+        seen: %{nonce: 1, settle_until: nil, settling: []},
         zoom: parse_zoom(session["zoom"]),
         scroll: :vertical,
         spread: :none,
@@ -908,11 +909,54 @@ defmodule EmbedPdf.Live.Viewer do
   def handle_info({:embed_pdf, {:page_loaded, n}}, socket),
     do: {:noreply, ensure_loaded(socket, n)}
 
+  def handle_info({:embed_pdf, {:seen, n, nonce}}, socket), do: {:noreply, seen(socket, n, nonce)}
+
   def handle_info({:embed_pdf, {:pointer, page, fx, fy, _kind}}, socket) do
     {:noreply, pointer(socket, page, fx, fy)}
   end
 
   def handle_info(_, socket), do: {:noreply, socket}
+
+  # ---------------------------------------------------------------- scroll position
+
+  # A page's marker crossed the middle of the viewport. After every real
+  # change the stylesheet's nonce is bumped so markers report again when
+  # they come back; the reports that the new stylesheet triggers at once
+  # (pages already in the middle) are "settling" reports and only pick
+  # the topmost page, so two pages in the band cannot ping-pong.
+  defp seen(socket, n, nonce) do
+    %{seen: seen, current_page: current, status: status} = socket.assigns
+    now = System.monotonic_time(:millisecond)
+
+    cond do
+      status != :ready or nonce != seen.nonce or n >= length(socket.assigns.sizes) ->
+        socket
+
+      seen.settle_until != nil and now < seen.settle_until ->
+        settling = [n | seen.settling]
+        top = Enum.min(settling)
+        socket = assign(socket, seen: %{seen | settling: settling})
+
+        socket =
+          if top != current,
+            do: socket |> assign(current_page: top) |> notify_parent({:page, top + 1}),
+            else: socket
+
+        ensure_loaded(socket, n)
+
+      n == current ->
+        ensure_loaded(socket, n)
+
+      true ->
+        socket
+        |> assign(
+          current_page: n,
+          seen: %{nonce: seen.nonce + 1, settle_until: now + 400, settling: []}
+        )
+        |> notify_parent({:page, n + 1})
+        |> ensure_loaded(n)
+    end
+  end
 
   # ---------------------------------------------------------------- pointer tools
 

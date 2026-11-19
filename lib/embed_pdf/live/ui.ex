@@ -24,8 +24,13 @@ defmodule EmbedPdf.Live.UI do
       data-epdf-viewer={@viewer_id}
       data-theme={@theme}
     >
-      <link rel="stylesheet" href={@base <> "/assets/viewer.css"} />
+      <link rel="stylesheet" href={"#{@base}/assets/viewer.css?v=#{EmbedPdf.Live.CSS.version()}"} />
       <link :if={@status == :ready} rel="stylesheet" href={"#{@base}/probe/#{@viewer_id}/#{@probe_nonce}.css"} />
+      <link
+        :if={@status == :ready and @scroll != :paged}
+        rel="stylesheet"
+        href={"#{@base}/seen/#{@viewer_id}/#{length(@sizes)}/#{@seen.nonce}.css"}
+      />
       <iframe name={"#{@viewer_id}-sink"} class="epdf-sink" title="" tabindex="-1" aria-hidden="true"></iframe>
 
       <.topbar {assigns} />

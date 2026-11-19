@@ -92,6 +92,9 @@ defmodule EmbedPdf.Live.PageComponent do
       aria-label={"#{t(assigns, "page.label")} #{@i + 1}"}
     >
       <img class="epdf-page-img" src={@src} loading="lazy" decoding="async" alt="" draggable="false" />
+      <div class="epdf-seen epdf-seen-1" aria-hidden="true"></div>
+      <div class="epdf-seen epdf-seen-2" aria-hidden="true"></div>
+      <div class="epdf-seen epdf-seen-3" aria-hidden="true"></div>
       <div :if={@text && @f["text.selection"]} class="epdf-text-layer"><%= for line <- @text do %><span class="epdf-tl" style={line.style}><%= for part <- line.words do %><%= case part do %><% {:word, text, from, to} -> %><span class="epdf-w" phx-click="word" phx-value-p={@i} phx-value-i={from} phx-value-j={to}>{text}</span><% {:space, text} -> %>{text}<% end %><% end %></span><br /><% end %></div>
       <div class="epdf-overlay">
         <%= for {rects, idx} <- @hits, {rect, k} <- Enum.with_index(rects) do %>

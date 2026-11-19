@@ -41,4 +41,18 @@ defmodule EmbedPdf.Live.Probe do
 
   @doc "Bucket size in pixels (the probe reports the lower bound)."
   def step, do: @step
+
+  @doc """
+  The scroll-position stylesheet: gives each page's markers the URL that
+  reports "page N is in the middle of the viewport" (see `.epdf-seen` in
+  the viewer CSS, driven by a scroll-driven animation).
+  """
+  @spec seen_css(String.t(), String.t(), non_neg_integer(), String.t()) :: String.t()
+  def seen_css(base, viewer, count, nonce) do
+    0..(count - 1)//1
+    |> Enum.map(fn n ->
+      "[id=\"#{viewer}-page-#{n}\"]{--epdf-seen:url(\"#{base}/seen?v=#{viewer}&p=#{n}&n=#{nonce}\")}"
+    end)
+    |> Enum.join("\n")
+  end
 end
