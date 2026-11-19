@@ -46,9 +46,16 @@ defmodule EmbedPdf.Web.Plug do
       opts =
         [rotation: rot] ++ if(forms?, do: [], else: [skip_annotations: widget_ids(entry.doc, n)])
 
-      svg =
-        Store.cached(doc, {:svg, rev, n, rot, forms?}, fn ->
-          entry.doc |> EmbedPdf.Render.SVG.render_page(n, opts) |> IO.iodata_to_binary()
+      gzip? = accepts_gzip?(conn)
+
+      body =
+        Store.cached(doc, {:svg, rev, n, rot, forms?, gzip?}, fn ->
+          svg =
+            Store.cached(doc, {:svg, rev, n, rot, forms?}, fn ->
+              entry.doc |> EmbedPdf.Render.SVG.render_page(n, opts) |> IO.iodata_to_binary()
+            end)
+
+          if gzip?, do: :zlib.gzip(svg), else: svg
         end)
 
       if viewer = conn.params["v"], do: notify(viewer, {:page_loaded, n})
@@ -56,7 +63,9 @@ defmodule EmbedPdf.Web.Plug do
       conn
       |> put_resp_content_type("image/svg+xml")
       |> put_resp_header("cache-control", "private, max-age=86400")
-      |> send_resp(200, svg)
+      |> put_resp_header("vary", "accept-encoding")
+      |> then(&if(gzip?, do: put_resp_header(&1, "content-encoding", "gzip"), else: &1))
+      |> send_resp(200, body)
       |> halt()
     else
       _ -> not_found(conn)
@@ -240,6 +249,12 @@ defmodule EmbedPdf.Web.Plug do
   defp route(conn, _), do: not_found(conn)
 
   # ---------------------------------------------------------------- helpers
+
+  defp accepts_gzip?(conn) do
+    conn
+    |> get_req_header("accept-encoding")
+    |> Enum.any?(&String.contains?(&1, "gzip"))
+  end
 
   defp widget_ids(doc, n) do
     alias EmbedPdf.PDF.Document

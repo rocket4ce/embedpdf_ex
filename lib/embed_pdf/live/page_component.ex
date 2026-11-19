@@ -23,7 +23,10 @@ defmodule EmbedPdf.Live.PageComponent do
       _ -> nil
     end
 
-    pointer? = a.tool in Viewer.point_tools() or (a.moving? and match?({^i, _}, a.selected))
+    pointer? =
+      a.tool in Viewer.point_tools() or
+        ((a.moving? or a.resizing?) and match?({^i, _}, a.selected))
+
     forms? = a.mode == :form and a.f["forms.filling"] == true
 
     hits =
@@ -55,6 +58,7 @@ defmodule EmbedPdf.Live.PageComponent do
       anchor_rects: anchor_rects,
       selected: on_page.(a.selected),
       moving?: a.moving?,
+      resizing?: a.resizing?,
       editing_text: on_page.(a.editing_text),
       points: for({^i, p} <- a.points, do: p),
       measure: if(a.measure && a.measure.page == i, do: a.measure),
@@ -209,6 +213,7 @@ defmodule EmbedPdf.Live.PageComponent do
       <button :if={@f["comments"]} class="epdf-btn" phx-click="panel" phx-value-side="right" phx-value-panel="comments" title={t(assigns, "annotation.comment")}><.icon name="comment" /></button>
       <button class="epdf-btn" phx-click="panel" phx-value-side="right" phx-value-panel="annotation" title={t(assigns, "annotation.style")}><.icon name="highlight" /></button>
       <button class={["epdf-btn", @moving? && "is-active"]} phx-click="move_annotation" title={t(assigns, "annotation.move")}><.icon name="move" /></button>
+      <button :if={@annot.subtype not in [:highlight, :underline, :strikeout, :squiggly, :text]} class={["epdf-btn", @resizing? && "is-active"]} phx-click="resize_annotation" title={t(assigns, "annotation.resize")}><.icon name="resize" /></button>
       <button class="epdf-btn" phx-click="duplicate_annotation" title={t(assigns, "annotation.duplicate")}><.icon name="copy" /></button>
       <button :if={@annot.subtype == :redact} class="epdf-btn epdf-danger" phx-click="redact_apply" phx-value-id={@annot.id} title={t(assigns, "redact.apply_one")}><.icon name="check" /></button>
       <button class="epdf-btn epdf-danger" phx-click="delete_annotation" title={t(assigns, "annotation.delete")}><.icon name="trash" /></button>

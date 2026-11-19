@@ -87,6 +87,14 @@ defmodule EmbedPdf.Live.CSS do
   .epdf-field-inline input[type=range]{width:90px}
   .epdf select,.epdf input[type=text],.epdf input[type=search],.epdf input[type=number],.epdf input[type=url],.epdf input[type=password],.epdf textarea{font:inherit;color:var(--epdf-text);background:var(--epdf-surface);border:1px solid var(--epdf-border);border-radius:6px;padding:5px 8px}
 
+  /* document tabs */
+  .epdf-doctabs{display:flex;align-items:flex-end;gap:2px;padding:4px 8px 0;background:var(--epdf-surface-2);border-bottom:1px solid var(--epdf-border);overflow-x:auto}
+  .epdf-doctab{display:flex;align-items:center;max-width:220px;border:1px solid transparent;border-bottom:0;border-radius:8px 8px 0 0}
+  .epdf-doctab.is-active{background:var(--epdf-surface);border-color:var(--epdf-border)}
+  .epdf-doctab-name{display:flex;align-items:center;gap:6px;border:0;background:none;color:var(--epdf-text);font:inherit;font-size:13px;padding:6px 4px 6px 10px;cursor:pointer;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+  .epdf-doctab-close{border:0;background:none;color:var(--epdf-muted);padding:4px 6px;cursor:pointer;display:flex;border-radius:4px}
+  .epdf-doctab-close:hover{background:var(--epdf-border)}
+
   /* hint */
   .epdf-hint{display:flex;align-items:center;gap:10px;justify-content:center;padding:6px 12px;background:var(--epdf-accent-soft);color:var(--epdf-text);font-size:13px;border-bottom:1px solid var(--epdf-border)}
 
@@ -99,6 +107,13 @@ defmodule EmbedPdf.Live.CSS do
   .epdf-panel-head{justify-content:space-between;padding-left:14px}
   .epdf-panel-body{flex:1;overflow:auto;padding:10px}
   .epdf-panel-actions{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}
+  /* compact bars, by the viewer's own width (it may be embedded at any size) */
+  .epdf{container-name:epdf;container-type:inline-size}
+  .epdf-topbar{flex-wrap:nowrap}
+  .epdf-topbar .epdf-tabs{flex:0 1 auto;min-width:0}
+  @container epdf (max-width:1180px){.epdf-title{max-width:16ch}.epdf-tab{padding:5px 10px}}
+  @container epdf (max-width:1020px){.epdf-title{display:none}.epdf-zoom-label{width:52px}}
+  @container epdf (max-width:820px){.epdf-topbar{flex-wrap:wrap}.epdf-tabs{order:3;flex:1 0 100%;margin:0}}
   @media (max-width:720px){.epdf-panel{position:absolute;top:0;bottom:0;z-index:40;box-shadow:var(--epdf-shadow)}.epdf-panel-left{left:0}.epdf-panel-right{right:0;width:min(320px,90vw)}.epdf-title{display:none}}
 
   /* viewport & pages */

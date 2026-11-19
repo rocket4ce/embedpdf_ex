@@ -159,4 +159,46 @@ defmodule EmbedPdf.Live.EditingTest do
     assert length(EmbedPdf.Outline.tree(a(view).doc)) == count + 1
     assert render(view) =~ "My bookmark"
   end
+
+  test "resize an annotation by clicking its new corner" do
+    view = mount_viewer("ebook.pdf")
+    render_click(view, "mode", %{"mode" => "shapes"})
+    render_click(view, "tool", %{"tool" => "square"})
+    send(view.pid, {:embed_pdf, {:pointer, 0, 0.1, 0.1, nil}})
+    send(view.pid, {:embed_pdf, {:pointer, 0, 0.3, 0.3, nil}})
+    render(view)
+    [sq] = Enum.filter(annots(view, 0), &(&1.subtype == :square))
+    render_click(view, "tool", %{"tool" => "square"})
+    render_click(view, "select_annotation", %{"page" => "0", "id" => "#{sq.id}"})
+    render_click(view, "resize_annotation", %{})
+    assert render(view) =~ ~s(type="image")
+    send(view.pid, {:embed_pdf, {:pointer, 0, 0.6, 0.5, nil}})
+    render(view)
+    [resized] = Enum.filter(annots(view, 0), &(&1.id == sq.id))
+    {x0, _, x1, _} = resized.rect
+    assert_in_delta x1 - x0, 0.5 * 612, 2.0
+    refute a(view).resizing?
+  end
+
+  test "opening another file adds a document tab" do
+    view = mount_viewer("ebook.pdf")
+    first = a(view).doc_id
+    id = a(view).viewer_id
+
+    upload =
+      file_input(view, "##{id}-upload", :pdf, [
+        %{name: "links.pdf", content: File.read!(fixture("links.pdf")), type: "application/pdf"}
+      ])
+
+    render_upload(upload, "links.pdf")
+    assert length(a(view).tabs) == 2
+    assert a(view).name == "links.pdf"
+    assert render(view) =~ "epdf-doctabs"
+
+    render_click(view, "switch_tab", %{"id" => first})
+    assert a(view).doc_id == first
+    render_click(view, "close_tab", %{"id" => first})
+    assert a(view).name == "links.pdf"
+    assert length(a(view).tabs) == 1
+  end
 end

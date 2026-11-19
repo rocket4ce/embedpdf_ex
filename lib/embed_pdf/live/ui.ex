@@ -34,6 +34,7 @@ defmodule EmbedPdf.Live.UI do
       <iframe name={"#{@viewer_id}-sink"} class="epdf-sink" title="" tabindex="-1" aria-hidden="true"></iframe>
 
       <.topbar {assigns} />
+      <.doc_tabs :if={@f["documents.tabs"] and length(@tabs) > 1} {assigns} />
       <.modebar :if={@status == :ready and @mode != :view} {assigns} />
       <.hint {assigns} />
 
@@ -197,6 +198,18 @@ defmodule EmbedPdf.Live.UI do
       <.live_file_input upload={@uploads.insert} />
       <.live_file_input upload={@uploads.attachment} />
     </form>
+    """
+  end
+
+  defp doc_tabs(assigns) do
+    ~H"""
+    <div class="epdf-doctabs" role="tablist">
+      <div :for={tab <- @tabs} class={["epdf-doctab", tab.id == @doc_id && "is-active"]} role="tab" aria-selected={to_string(tab.id == @doc_id)}>
+        <button class="epdf-doctab-name" phx-click="switch_tab" phx-value-id={tab.id} title={tab.name}><.icon name="file" class="epdf-icon-sm" /> {tab.name}</button>
+        <button class="epdf-doctab-close" phx-click="close_tab" phx-value-id={tab.id} title={t(assigns, "close")} aria-label={t(assigns, "close")}><.icon name="close" class="epdf-icon-sm" /></button>
+      </div>
+      <label :if={@f["documents.open"]} class="epdf-btn epdf-btn-sm" for={@uploads.pdf.ref} title={t(assigns, "menu.open")}><.icon name="plus" class="epdf-icon-sm" /></label>
+    </div>
     """
   end
 
@@ -402,6 +415,7 @@ defmodule EmbedPdf.Live.UI do
   defp hint_key(%{status: :ready} = a) do
     cond do
       a.moving? -> "annotation.move_hint"
+      a.resizing? -> "annotation.resize_hint"
       a.tool in Viewer.text_tools() and a.anchor -> "hint.text_end"
       a.tool in Viewer.text_tools() -> "hint.text"
       a.tool in [:square, :circle, :redact_area] and a.points != [] -> "hint.second_point"

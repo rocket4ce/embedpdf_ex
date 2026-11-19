@@ -77,6 +77,7 @@ defmodule EmbedPdf.Live.Viewer do
         anchor: nil,
         selected: nil,
         moving?: false,
+        resizing?: false,
         editing_text: nil,
         style: default_style(),
         stamp: "approved",
@@ -97,6 +98,8 @@ defmodule EmbedPdf.Live.Viewer do
         measure: nil,
         flash_msg: nil,
         pending_password: nil,
+        tabs: [],
+        tab_state: %{},
         parent: socket.parent_pid
       )
       |> allow_upload(:pdf,
@@ -187,6 +190,13 @@ defmodule EmbedPdf.Live.Viewer do
     id = id || Store.put(doc, name: name)
     if connected?(socket), do: Store.keep(id, self())
     sizes = Enum.map(doc.pages, &Page.display_size/1)
+    socket = stash_tab(socket)
+    saved = Map.get(socket.assigns.tab_state, id, %{})
+
+    tabs =
+      if Enum.any?(socket.assigns.tabs, &(&1.id == id)),
+        do: socket.assigns.tabs,
+        else: socket.assigns.tabs ++ [%{id: id, name: name}]
 
     socket
     |> assign(
@@ -195,11 +205,11 @@ defmodule EmbedPdf.Live.Viewer do
       doc_id: id,
       name: name,
       rev: (Store.get(id) || %{revision: 0}).revision,
-      page_revs: %{},
+      page_revs: Map.get(saved, :page_revs, %{}),
       sizes: sizes,
-      history: %{undo: [], redo: []},
-      dirty?: false,
-      current_page: 0,
+      history: Map.get(saved, :history, %{undo: [], redo: []}),
+      dirty?: Map.get(saved, :dirty?, false),
+      current_page: Map.get(saved, :current_page, 0),
       loaded: MapSet.new(),
       text: %{},
       annots: %{},
@@ -209,8 +219,25 @@ defmodule EmbedPdf.Live.Viewer do
       selected: nil,
       search: %{socket.assigns.search | hits: [], current: nil},
       dialog: nil,
-      pending_password: nil
+      pending_password: nil,
+      tabs: tabs
     )
+  end
+
+  # remembers the open document's history and position before another tab takes over
+  defp stash_tab(%{assigns: %{doc_id: nil}} = socket), do: socket
+
+  defp stash_tab(socket) do
+    a = socket.assigns
+
+    state = %{
+      history: a.history,
+      dirty?: a.dirty?,
+      current_page: a.current_page,
+      page_revs: a.page_revs
+    }
+
+    assign(socket, tab_state: Map.put(a.tab_state, a.doc_id, state))
   end
 
   # ---------------------------------------------------------------- render
@@ -518,8 +545,41 @@ defmodule EmbedPdf.Live.Viewer do
     end
   end
 
+  def handle_event("resize_annotation", _, socket),
+    do: {:noreply, assign(socket, resizing?: not socket.assigns.resizing?, moving?: false)}
+
+  def handle_event("switch_tab", %{"id" => id}, socket) do
+    case Store.get(id) do
+      %Store.Entry{doc: doc, name: name} when id != socket.assigns.doc_id ->
+        {:noreply,
+         socket |> clear_tool() |> use_doc(doc, name, id) |> goto(socket_page(socket, id))}
+
+      _ ->
+        {:noreply, socket}
+    end
+  end
+
+  def handle_event("close_tab", %{"id" => id}, socket) do
+    tabs = Enum.reject(socket.assigns.tabs, &(&1.id == id))
+    socket = assign(socket, tabs: tabs, tab_state: Map.delete(socket.assigns.tab_state, id))
+
+    cond do
+      id != socket.assigns.doc_id ->
+        {:noreply, socket}
+
+      tabs == [] ->
+        {:noreply, assign(socket, status: :empty, doc: nil, doc_id: nil, sizes: [], menu: nil)}
+
+      true ->
+        %{id: next} = List.last(tabs)
+        %Store.Entry{doc: doc, name: name} = Store.get(next)
+        socket = assign(socket, doc_id: nil)
+        {:noreply, socket |> clear_tool() |> use_doc(doc, name, next)}
+    end
+  end
+
   def handle_event("move_annotation", _, socket),
-    do: {:noreply, assign(socket, moving?: not socket.assigns.moving?)}
+    do: {:noreply, assign(socket, moving?: not socket.assigns.moving?, resizing?: false)}
 
   def handle_event("nudge", %{"dx" => dx, "dy" => dy}, socket) do
     case socket.assigns.selected do
@@ -864,6 +924,11 @@ defmodule EmbedPdf.Live.Viewer do
     end
   end
 
+  def handle_event("close_document", _, %{assigns: %{doc_id: id}} = socket) when is_binary(id) do
+    {:noreply, socket} = handle_event("close_tab", %{"id" => id}, socket)
+    {:noreply, assign(socket, menu: nil, dialog: if(socket.assigns.status == :empty, do: :open))}
+  end
+
   def handle_event("close_document", _, socket) do
     {:noreply,
      assign(socket, status: :empty, doc: nil, doc_id: nil, sizes: [], menu: nil, dialog: :open)}
@@ -968,6 +1033,9 @@ defmodule EmbedPdf.Live.Viewer do
     socket = assign(socket, current_page: page)
 
     cond do
+      a.resizing? and a.selected ->
+        resize_selected_to(socket, page, point)
+
       a.moving? and a.selected ->
         move_selected_to(socket, page, point)
 
@@ -1197,6 +1265,35 @@ defmodule EmbedPdf.Live.Viewer do
         }
 
         add_annotation(socket, page, attrs)
+    end
+  end
+
+  # keeps the displayed top-left corner and moves the opposite one to the click
+  defp resize_selected_to(socket, page, {px, py}) do
+    {sel_page, id} = socket.assigns.selected
+
+    with true <- sel_page == page,
+         %{} = annot <- Enum.find(annotations_for(socket, page), &(&1.id == id)) do
+      pg = Document.page(socket.assigns.doc, page)
+      {x0, y0, _x1, _y1} = Page.rect_to_display(pg, annot.rect)
+
+      display =
+        {min(x0, px), min(y0, py), max(max(x0, px), min(x0, px) + 4),
+         max(max(y0, py), min(y0, py) + 4)}
+
+      {doc, _} =
+        EmbedPdf.Annotations.resize(socket.assigns.doc, id, Page.rect_to_user(pg, display))
+
+      socket |> commit(doc, [page]) |> assign(resizing?: false)
+    else
+      _ -> assign(socket, resizing?: false)
+    end
+  end
+
+  defp socket_page(socket, id) do
+    case socket.assigns.tab_state do
+      %{^id => %{current_page: p}} -> p
+      _ -> 0
     end
   end
 
@@ -1557,7 +1654,7 @@ defmodule EmbedPdf.Live.Viewer do
   end
 
   defp clear_tool(socket),
-    do: assign(socket, points: [], anchor: nil, moving?: false, measure: nil)
+    do: assign(socket, points: [], anchor: nil, moving?: false, resizing?: false, measure: nil)
 
   defp refresh_lists(socket) do
     a = socket.assigns
