@@ -263,6 +263,16 @@ defmodule EmbedPdf.Live.CSS do
   .epdf-drop{border:2px dashed var(--epdf-border);border-radius:12px;padding:24px;text-align:center}
   .epdf-snapshot{display:block;max-width:100%;max-height:50vh;margin:0 auto;background:#fff;box-shadow:var(--epdf-shadow)}
 
+  /* form design */
+  .epdf-segmented{display:inline-flex;gap:2px;padding:2px;border-radius:8px;background:var(--epdf-border)}
+  .epdf-segmented .epdf-btn{height:28px}
+  .epdf-segmented .epdf-btn.is-active{background:var(--epdf-surface);color:var(--epdf-text)}
+  .epdf-field-outline{position:absolute;margin:0;padding:0;border:1px dashed var(--epdf-accent);border-radius:2px;background:rgba(59,108,246,.08);cursor:pointer}
+  .epdf-field-outline:hover{background:rgba(59,108,246,.16)}
+  .epdf-field-outline.is-selected{border:2px solid var(--epdf-accent);background:rgba(59,108,246,.14)}
+  .epdf-field-name{position:absolute;left:0;bottom:100%;margin-bottom:2px;font-size:10px;line-height:1.2;padding:0 4px;border-radius:3px;background:var(--epdf-accent);color:#fff;white-space:nowrap;pointer-events:none;opacity:0}
+  .epdf-field-outline:hover .epdf-field-name,.epdf-field-outline.is-selected .epdf-field-name{opacity:1}
+
   @media print{.epdf-topbar,.epdf-modebar,.epdf-hint,.epdf-panel,.epdf-pager{display:none!important}.epdf-viewport{overflow:visible}}
   """
 

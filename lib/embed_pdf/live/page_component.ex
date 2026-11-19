@@ -23,11 +23,14 @@ defmodule EmbedPdf.Live.PageComponent do
       _ -> nil
     end
 
+    design? = a.mode == :form and a[:form_design?] == true and a.f["forms.building"] == true
+
     pointer? =
       a.tool in Viewer.point_tools() or
-        ((a.moving? or a.resizing?) and match?({^i, _}, a.selected))
+        ((a.moving? or a.resizing?) and match?({^i, _}, a.selected)) or
+        (a[:field_action] != nil and match?({^i, _}, a[:field]))
 
-    forms? = a.mode == :form and a.f["forms.filling"] == true
+    forms? = a.mode == :form and a.f["forms.filling"] == true and not design?
 
     hits =
       a.search.hits
@@ -64,6 +67,9 @@ defmodule EmbedPdf.Live.PageComponent do
       measure: if(a.measure && a.measure.page == i, do: a.measure),
       fields: if(forms?, do: a.fields || [], else: []),
       forms?: forms?,
+      design?: design?,
+      design_fields: if(design?, do: a.fields || [], else: []),
+      selected_field: on_page.(a[:field]),
       pointer?: pointer?,
       px: if(pointer?, do: {elem(size, 0) * Viewer.scale(a), elem(size, 1) * Viewer.scale(a)}),
       mode: a.mode,
@@ -107,6 +113,7 @@ defmodule EmbedPdf.Live.PageComponent do
         <.points_preview :if={@points != []} {assigns} />
         <.measure_mark :if={@measure} {assigns} />
         <.form_fields :if={@fields != []} {assigns} />
+        <EmbedPdf.Live.FormDesign.outlines :if={@design? and @design_fields != []} {assigns} />
       </div>
       <form :if={@pointer?} class="epdf-pointer" method="get" action={"#{@base}/pointer"} target={"#{@viewer_id}-sink"}>
         <input type="hidden" name="v" value={@viewer_id} />

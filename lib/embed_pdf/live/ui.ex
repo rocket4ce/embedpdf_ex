@@ -271,6 +271,7 @@ defmodule EmbedPdf.Live.UI do
         <.style_controls :if={@mode in [:annotate, :shapes] and @tool not in [:pointer, :pan]} {assigns} />
 
         <button :if={@mode == :form and @f["forms.filling"]} class="epdf-btn epdf-btn-text" phx-click="form_reset">{t(assigns, "form.reset")}</button>
+        <EmbedPdf.Live.FormDesign.toolbar :if={@mode == :form and @f["forms.building"]} {assigns} />
 
         <button :if={@mode == :redact} class="epdf-btn epdf-btn-text epdf-danger" phx-click="redact_apply">
           <.icon name="check" /> {t(assigns, "redact.apply")}
@@ -420,6 +421,7 @@ defmodule EmbedPdf.Live.UI do
 
   defp hint_key(%{status: :ready} = a) do
     cond do
+      key = EmbedPdf.Live.FormDesign.hint_key(a) -> key
       a.moving? -> "annotation.move_hint"
       a.resizing? -> "annotation.resize_hint"
       a.tool in Viewer.text_tools() and a.anchor -> "hint.text_end"
@@ -651,6 +653,7 @@ defmodule EmbedPdf.Live.UI do
         <.comments_panel :if={@right == :comments} {assigns} />
         <.annotation_panel :if={@right == :annotation} {assigns} />
         <.redact_panel :if={@right == :redact} {assigns} />
+        <EmbedPdf.Live.FormDesign.panel :if={@right == :field} {assigns} />
       </div>
     </aside>
     """
@@ -660,6 +663,7 @@ defmodule EmbedPdf.Live.UI do
   defp panel_title(:comments), do: "panel.comments"
   defp panel_title(:annotation), do: "annotation.properties"
   defp panel_title(:redact), do: "redact.pending"
+  defp panel_title(:field), do: "field.properties"
   defp panel_title(_), do: "panel.sidebar"
 
   defp search_panel(assigns) do

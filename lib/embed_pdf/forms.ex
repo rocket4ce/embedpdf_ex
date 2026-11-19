@@ -845,6 +845,31 @@ defmodule EmbedPdf.Forms do
     )
   end
 
+  # ---------------------------------------------------------------- building
+
+  defdelegate add_field(doc, page_index, rect, type, opts \\ []), to: EmbedPdf.Forms.Builder
+  defdelegate update_field(doc, id, attrs), to: EmbedPdf.Forms.Builder
+  defdelegate move_field(doc, widget_id, dx, dy), to: EmbedPdf.Forms.Builder
+  defdelegate resize_field(doc, widget_id, rect), to: EmbedPdf.Forms.Builder
+  defdelegate delete_field(doc, id), to: EmbedPdf.Forms.Builder
+  defdelegate duplicate_field(doc, id), to: EmbedPdf.Forms.Builder
+
+  @doc false
+  # Redraws a field's widgets for `value` (used by the form builder after
+  # creating or changing a field). Check boxes and radio buttons get fresh
+  # appearances for the on-states their widget maps carry.
+  def regenerate(doc, field, value) do
+    doc =
+      if field.type in [:checkbox, :radio],
+        do:
+          Enum.reduce(field.widgets, doc, fn w, d ->
+            update_dict(d, w.id, &Map.delete(&1, "AP"))
+          end),
+        else: doc
+
+    doc |> write_value(field, value) |> no_need_appearances()
+  end
+
   @doc "Removes widget annotations (by id) from the field tree, dropping fields left without widgets."
   @spec remove_widgets(Document.t(), [integer()]) :: Document.t()
   def remove_widgets(doc, ids) do

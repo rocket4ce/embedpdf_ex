@@ -80,6 +80,10 @@ defmodule EmbedPdf.Live.Viewer do
         resizing?: false,
         editing_page?: false,
         refocus: 0,
+        # form design (EmbedPdf.Live.FormDesign)
+        form_design?: false,
+        field: nil,
+        field_action: nil,
         editing_text: nil,
         style: default_style(),
         stamp: "approved",
@@ -804,6 +808,10 @@ defmodule EmbedPdf.Live.Viewer do
 
   def handle_event("form_change", _, socket), do: {:noreply, socket}
 
+  # form design: every "field_*" event (EmbedPdf.Live.FormDesign)
+  def handle_event("field_" <> _ = event, params, socket),
+    do: EmbedPdf.Live.FormDesign.event(event, params, socket)
+
   def handle_event("form_reset", _, socket) do
     {:noreply,
      socket
@@ -1061,6 +1069,9 @@ defmodule EmbedPdf.Live.Viewer do
     socket = assign(socket, current_page: page)
 
     cond do
+      EmbedPdf.Live.FormDesign.handles?(a) ->
+        EmbedPdf.Live.FormDesign.pointer(socket, page, point)
+
       a.resizing? and a.selected ->
         resize_selected_to(socket, page, point)
 
@@ -1667,6 +1678,9 @@ defmodule EmbedPdf.Live.Viewer do
           measure: nil
         )
 
+      k when k in ["Delete", "Backspace"] and a.field != nil and a.mode == :form ->
+        elem(EmbedPdf.Live.FormDesign.event("field_delete", %{}, socket), 1)
+
       k when k in ["Delete", "Backspace"] and a.selected != nil ->
         elem(handle_event("delete_annotation", %{}, socket), 1)
 
@@ -1694,7 +1708,15 @@ defmodule EmbedPdf.Live.Viewer do
   end
 
   defp clear_tool(socket),
-    do: assign(socket, points: [], anchor: nil, moving?: false, resizing?: false, measure: nil)
+    do:
+      assign(socket,
+        points: [],
+        anchor: nil,
+        moving?: false,
+        resizing?: false,
+        measure: nil,
+        field_action: nil
+      )
 
   defp refresh_lists(socket) do
     a = socket.assigns
@@ -1772,23 +1794,24 @@ defmodule EmbedPdf.Live.Viewer do
 
   @doc false
   def point_tools,
-    do: [
-      :note,
-      :stamp,
-      :free_text,
-      :square,
-      :circle,
-      :line,
-      :arrow,
-      :redact_area,
-      :snapshot,
-      :zoom_area,
-      :link,
-      :ink,
-      :polygon,
-      :polyline,
-      :measure
-    ]
+    do:
+      [
+        :note,
+        :stamp,
+        :free_text,
+        :square,
+        :circle,
+        :line,
+        :arrow,
+        :redact_area,
+        :snapshot,
+        :zoom_area,
+        :link,
+        :ink,
+        :polygon,
+        :polyline,
+        :measure
+      ] ++ EmbedPdf.Live.FormDesign.tools()
 
   defp default_style do
     %{
