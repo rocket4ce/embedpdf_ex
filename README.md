@@ -73,7 +73,7 @@ See `EmbedPdf.Signatures.sign/3`.
 ## Using the engine directly
 
 ```elixir
-{:ok, doc} = EmbedPdf.open("manual.pdf", password: "secret")
+{:ok, doc} = EmbedPdf.open_file("manual.pdf", password: "secret")
 EmbedPdf.page_count(doc)
 EmbedPdf.text(doc, 0)
 EmbedPdf.search(doc, "warranty", whole_word: true)
@@ -96,6 +96,53 @@ information from standard browser behavior instead:
 | Menus, dialogs, keyboard | Server state with `phx-click`, `phx-click-away` and `phx-keydown`. |
 | Print | A print view (HTML, one page image per sheet) opens in a new tab; press Ctrl/⌘+P. |
 | Full screen | A fixed full-window layout (the browser Fullscreen API needs JavaScript). |
+
+## Security
+
+PDFs are treated as untrusted input, and so is everything a browser sends.
+
+- **Opening**: `EmbedPdf.open/2` only ever takes bytes. Use `EmbedPdf.open_file/2` for a
+  path you chose; bytes from a user can never make the server read one of its files.
+- **Access to documents**: page images, downloads and the print view are addressed by a
+  random 128-bit document id, which works as the key to that document. Give each user
+  their own id (the viewer does this for `path` and uploads) and do not log these URLs.
+- **Features are enforced on the server**: `read_only` and every feature you turn off are
+  checked for each event and upload, not just hidden. A read-only viewer never changes
+  the stored document.
+- **Sealing**: only viewers with `signatures.signing` on can ask the server to sign with
+  the configured certificate. Turn it off (or use `read_only`) wherever users should not
+  sign in the organization's name.
+- **Nothing in a PDF runs in your origin**: page images and the print view are served
+  with a Content-Security-Policy without script sources, attachments are only offered
+  as downloads (never as `text/html` or SVG), links are limited to `http(s)`, `mailto`
+  and `tel`, and JavaScript inside PDFs is not executed.
+- **Session**: the `path` and `password` you pass to the viewer are encrypted before
+  they reach the browser.
+- **Hostile files**: a small PDF can ask for gigabytes or for endless work. The engine
+  bounds decoded streams, image sizes, operators per page, nesting, fonts and page
+  counts, and everything done with a document runs in a process with a heap limit and
+  a deadline (`EmbedPdf.Limits`). A file that goes over a limit fails or draws partly;
+  it does not take the server with it. `EmbedPdf.open/2` returns
+  `{:error, :too_complex}` in that case. The defaults:
+
+  ```elixir
+  config :embedpdf_ex,
+    max_pdf_size: 100_000_000,          # upload, bytes
+    max_attachment_size: 50_000_000,    # upload, bytes
+    max_heap_bytes: 1_000_000_000,      # per operation on a document
+    max_operation_ms: 30_000,           # per operation on a document
+    max_stream_bytes: 256_000_000,      # one decoded stream
+    max_image_bytes: 64_000_000,        # one decoded image
+    max_page_operators: 3_000_000,      # drawing work per page
+    max_pages: 100_000,
+    max_font_bytes: 30_000_000,
+    render_cache_bytes: 128_000_000     # rendered pages kept in memory
+  ```
+
+- **Signatures**: a valid signature means the signed bytes are intact and were signed
+  with the certificate shown. A document changed after signing without a new signature
+  is reported as *changed after signing*, never as plain valid. Whether the
+  certificate is trusted or revoked is not checked.
 
 ## Differences from EmbedPDF
 

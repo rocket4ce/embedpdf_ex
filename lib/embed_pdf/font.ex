@@ -75,6 +75,7 @@ defmodule EmbedPdf.Font do
     program = Program.load(doc, descriptor, subtype)
 
     {encoding, differences?} = simple_encoding(doc, dict, standard, program, symbolic?, embedded?)
+    encoding = bound_names(encoding)
     afm = AFM.get(standard)
 
     widths = simple_widths(doc, dict, encoding, afm)
@@ -120,6 +121,22 @@ defmodule EmbedPdf.Font do
   end
 
   defp program_widths(font), do: font
+
+  # Glyph names are looked up (hashed, split, compared) for every glyph
+  # shown, so a name of megabytes from /Differences or from the font program
+  # would make each glyph cost its length. No real name comes near the
+  # bound (the glyph list convention allows 63 characters, PDF names 127).
+  @max_glyph_name 255
+
+  defp bound_names(encoding) when is_map(encoding) do
+    if Enum.any?(encoding, &long_name?/1),
+      do: encoding |> Enum.reject(&long_name?/1) |> Map.new(),
+      else: encoding
+  end
+
+  defp bound_names(encoding), do: encoding
+
+  defp long_name?({_code, name}), do: is_binary(name) and byte_size(name) > @max_glyph_name
 
   defp descriptor_metric(doc, descriptor, key, afm_value, default) do
     case Document.resolve(doc, descriptor[key]) do
@@ -193,7 +210,8 @@ defmodule EmbedPdf.Font do
     {encoding, diffs?} =
       case Document.resolve(doc, dict["Encoding"]) do
         %{} = e ->
-          {Encoding.apply_differences(%{}, Document.resolve(doc, e["Differences"])), true}
+          {bound_names(Encoding.apply_differences(%{}, Document.resolve(doc, e["Differences"]))),
+           true}
 
         _ ->
           {%{}, false}
@@ -299,12 +317,20 @@ defmodule EmbedPdf.Font do
     }
   end
 
+  # `c [w1 w2 …]` and `c_first c_last w` entries of /W. Ranges are expanded
+  # into the map while fewer than @max_expanded_cids CIDs have been (a font
+  # has at most 65,536); past that, and for very wide ranges, they stay
+  # compact as `{first, last, w}` under `:ranges`, at most @max_width_ranges
+  # of them, since each is scanned on lookup.
+  @max_expanded_cids 65_536
+  @max_width_ranges 64
+
   defp cid_widths(doc, list) when is_list(list),
-    do: cid_w(Enum.map(list, &Document.resolve(doc, &1)), doc, %{})
+    do: cid_w(Enum.map(list, &Document.resolve(doc, &1)), doc, %{}, 0)
 
   defp cid_widths(_, _), do: %{}
 
-  defp cid_w([first, ws | rest], doc, acc) when is_integer(first) and is_list(ws) do
+  defp cid_w([first, ws | rest], doc, acc, used) when is_integer(first) and is_list(ws) do
     acc =
       ws
       |> Enum.with_index(first)
@@ -313,21 +339,36 @@ defmodule EmbedPdf.Font do
         if is_number(w), do: Map.put(acc, cid, w / 1000), else: acc
       end)
 
-    cid_w(rest, doc, acc)
+    cid_w(rest, doc, acc, used)
   end
 
-  defp cid_w([first, last, w | rest], doc, acc)
+  defp cid_w([first, last, w | rest], doc, acc, used)
        when is_integer(first) and is_integer(last) and is_number(w) do
-    # very large ranges are kept compact as a range entry
-    acc =
-      if last - first > 5000,
-        do: Map.update(acc, :ranges, [{first, last, w / 1000}], &[{first, last, w / 1000} | &1]),
-        else: Enum.reduce(first..last//1, acc, &Map.put(&2, &1, w / 1000))
+    count = max(last - first + 1, 0)
 
-    cid_w(rest, doc, acc)
+    cond do
+      count == 0 ->
+        cid_w(rest, doc, acc, used)
+
+      # very large ranges are kept compact as a range entry
+      last - first > 5000 or used + count > @max_expanded_cids ->
+        cid_w(rest, doc, put_width_range(acc, {first, last, w / 1000}), used)
+
+      true ->
+        acc = Enum.reduce(first..last//1, acc, &Map.put(&2, &1, w / 1000))
+        cid_w(rest, doc, acc, used + count)
+    end
   end
 
-  defp cid_w(_, _doc, acc), do: acc
+  defp cid_w(_, _doc, acc, _used), do: acc
+
+  defp put_width_range(acc, range) do
+    case acc do
+      %{ranges: ranges} when length(ranges) >= @max_width_ranges -> acc
+      %{ranges: ranges} -> %{acc | ranges: [range | ranges]}
+      _ -> Map.put(acc, :ranges, [range])
+    end
+  end
 
   defp load_to_unicode(doc, dict) do
     case Document.resolve(doc, dict["ToUnicode"]) do

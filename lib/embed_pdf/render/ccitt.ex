@@ -7,8 +7,10 @@ defmodule EmbedPdf.Render.CCITT do
 
   Output rows are packed 1-bit samples; following PDF, black is 0 unless
   `/BlackIs1 true`. Damaged data yields the rows decoded so far, padded
-  with white.
+  with white. No more rows are produced than fit in `max_bytes`.
   """
+
+  @max_bytes 64_000_000
 
   # {bits as string, run length}
   @white_codes [
@@ -221,10 +223,12 @@ defmodule EmbedPdf.Render.CCITT do
 
   @doc """
   Decodes CCITT data for a `width` × `height` image (`params` is the
-  `DecodeParms` dictionary). Returns packed rows.
+  `DecodeParms` dictionary). Returns packed rows, `max_bytes` of them at
+  most (default #{@max_bytes}).
   """
-  @spec decode(binary(), map(), non_neg_integer(), non_neg_integer()) :: {:ok, binary()} | :error
-  def decode(data, params, width, height) do
+  @spec decode(binary(), map(), non_neg_integer(), non_neg_integer(), pos_integer()) ::
+          {:ok, binary()} | :error
+  def decode(data, params, width, height, max_bytes \\ @max_bytes) do
     k = int(params["K"], 0)
     columns = int(params["Columns"], 1728)
     columns = if columns > 0, do: columns, else: width
@@ -236,21 +240,15 @@ defmodule EmbedPdf.Render.CCITT do
     if columns <= 0 or rows <= 0 or columns > 100_000 do
       :error
     else
-      lines = decode_lines(data, k, columns, rows, align?)
       row_bytes = div(columns + 7, 8)
-      white = if black_is_1, do: 0, else: 1
+      rows = min(rows, div(max_bytes, row_bytes))
+      # rows are packed as they come: their changing elements take far more
+      packed = decode_lines(data, k, columns, rows, align?, &pack(&1, columns, black_is_1))
+      white = if black_is_1, do: 0, else: 0xFF
+      # the rows the data did not give are white
+      blank = :binary.copy(<<white>>, row_bytes * max(rows - length(packed), 0))
 
-      packed =
-        lines
-        |> Enum.map(&pack(&1, columns, black_is_1))
-        |> then(fn rows_out ->
-          missing = rows - length(rows_out)
-          blank = :binary.copy(<<if(white == 1, do: 0xFF, else: 0)>>, row_bytes)
-          rows_out ++ List.duplicate(blank, max(missing, 0))
-        end)
-        |> Enum.take(rows)
-
-      {:ok, IO.iodata_to_binary(packed)}
+      {:ok, IO.iodata_to_binary([packed, blank])}
     end
   rescue
     _ -> :error
@@ -261,15 +259,15 @@ defmodule EmbedPdf.Render.CCITT do
 
   # ---------------------------------------------------------------- lines
 
-  defp decode_lines(data, k, columns, rows, align?) do
+  defp decode_lines(data, k, columns, rows, align?, pack) do
     initial_ref = [columns, columns]
-    loop(data, k, columns, rows, align?, initial_ref, [], 0)
+    loop(data, k, columns, rows, align?, initial_ref, [], 0, pack)
   end
 
-  defp loop(_bits, _k, _columns, rows, _align?, _ref, acc, n) when n >= rows,
+  defp loop(_bits, _k, _columns, rows, _align?, _ref, acc, n, _pack) when n >= rows,
     do: Enum.reverse(acc)
 
-  defp loop(bits, k, columns, rows, align?, ref, acc, n) do
+  defp loop(bits, k, columns, rows, align?, ref, acc, n, pack) do
     bits = if align? and k < 0, do: align(bits), else: bits
 
     result =
@@ -307,8 +305,9 @@ defmodule EmbedPdf.Render.CCITT do
           rows,
           align?,
           changes ++ [columns, columns],
-          [changes | acc],
-          n + 1
+          [pack.(changes) | acc],
+          n + 1,
+          pack
         )
 
       _ ->
@@ -356,17 +355,23 @@ defmodule EmbedPdf.Render.CCITT do
 
   # ---------------------------------------------------------------- 2D (READ / MMR)
 
-  defp decode_2d(bits, ref, columns), do: two_d(bits, ref, columns, -1, :white, [])
+  # `ref` is what is left of the reference line's changing elements to the
+  # right of a0 (they are in order and a0 only moves right), `i` the index
+  # of its first one, modulo 2.
+  defp decode_2d(bits, ref, columns), do: two_d(bits, ref, 0, columns, -1, :white, [])
 
-  defp two_d(bits, _ref, columns, a0, _color, changes) when a0 >= columns,
+  defp two_d(bits, _ref, _i, columns, a0, _color, changes) when a0 >= columns,
     do: {:ok, Enum.reverse(changes), bits}
 
-  defp two_d(bits, ref, columns, a0, color, changes) do
-    {b1, b2} = b1_b2(ref, a0, color)
+  defp two_d(bits, [x | ref], i, columns, a0, color, changes) when x <= a0,
+    do: two_d(bits, ref, 1 - i, columns, a0, color, changes)
+
+  defp two_d(bits, ref, i, columns, a0, color, changes) do
+    {b1, b2} = b1_b2(ref, i, color)
 
     case mode(bits) do
       {:pass, rest} ->
-        two_d(rest, ref, columns, b2, color, changes)
+        two_d(rest, ref, i, columns, b2, color, changes)
 
       {:horizontal, rest} ->
         start = max(a0, 0)
@@ -375,7 +380,7 @@ defmodule EmbedPdf.Render.CCITT do
              {:ok, r2, rest} <- run(rest, flip(color), 0) do
           a1 = min(start + r1, columns)
           a2 = min(a1 + r2, columns)
-          two_d(rest, ref, columns, a2, color, [a2, a1 | changes])
+          two_d(rest, ref, i, columns, a2, color, [a2, a1 | changes])
         else
           _ -> partial(changes)
         end
@@ -383,7 +388,7 @@ defmodule EmbedPdf.Render.CCITT do
       {{:vertical, d}, rest} ->
         # a changing element can never move left of a0
         a1 = (b1 + d) |> max(0) |> min(columns) |> max(a0)
-        two_d(rest, ref, columns, a1, flip(color), [a1 | changes])
+        two_d(rest, ref, i, columns, a1, flip(color), [a1 | changes])
 
       :eol ->
         partial(changes)
@@ -398,21 +403,20 @@ defmodule EmbedPdf.Render.CCITT do
 
   # b1: first changing element on the reference line to the right of a0 whose
   # color is the opposite of a0's (changes at even indices turn black)
-  defp b1_b2(ref, a0, color) do
-    want_parity = if color == :white, do: 0, else: 1
-    find_b1(ref, 0, a0, want_parity)
-  end
+  # Every element of `ref` is to the right of a0, so b1 is its first or its
+  # second one; b2 is the element after b1.
+  defp b1_b2(ref, i, color) do
+    want = if color == :white, do: 0, else: 1
 
-  defp find_b1([], _i, _a0, _parity), do: {100_000_000, 100_000_000}
-
-  defp find_b1([x | rest], i, a0, parity) do
-    if x > a0 and rem(i, 2) == parity do
-      b2 = List.first(rest) || x
-      {x, b2}
-    else
-      find_b1(rest, i + 1, a0, parity)
+    case ref do
+      [b1 | rest] when i == want -> {b1, b2(rest, b1)}
+      [_, b1 | rest] when i != want -> {b1, b2(rest, b1)}
+      _ -> {100_000_000, 100_000_000}
     end
   end
+
+  defp b2([x | _], _b1), do: x
+  defp b2([], b1), do: b1
 
   defp mode(<<1::1, rest::bitstring>>), do: {{:vertical, 0}, rest}
   defp mode(<<0b011::3, rest::bitstring>>), do: {{:vertical, 1}, rest}

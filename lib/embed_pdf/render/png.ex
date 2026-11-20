@@ -32,12 +32,10 @@ defmodule EmbedPdf.Render.PNG do
   def encode(width, height, color_type, bit_depth, data, opts \\ []) do
     data = IO.iodata_to_binary(data)
     row = row_bytes(width, color_type, bit_depth)
-    data = fit(data, row * height)
-
-    raw = for <<r::binary-size(row) <- data>>, do: [0, r]
+    raw = rows(data, row, height)
 
     # big images: favor speed over a few percent of size
-    level = Keyword.get(opts, :level, if(byte_size(data) > 4_000_000, do: 1, else: 6))
+    level = Keyword.get(opts, :level, if(row * height > 4_000_000, do: 1, else: 6))
     idat = compress(raw, level)
 
     ihdr =
@@ -84,9 +82,31 @@ defmodule EmbedPdf.Render.PNG do
   defp color_code(:gray_alpha), do: 4
   defp color_code(:rgba), do: 6
 
-  defp fit(data, size) when byte_size(data) == size, do: data
-  defp fit(data, size) when byte_size(data) > size, do: binary_part(data, 0, size)
-  defp fit(data, size), do: data <> :binary.copy(<<0>>, size - byte_size(data))
+  # `height` rows, each behind its filter byte. Rows the data does not have
+  # are zeros: one blank row stands for all of them, so a short `data` is
+  # not padded out in memory.
+  defp rows(data, row, height) do
+    full = min(div(byte_size(data), row), height)
+    present = binary_part(data, 0, full * row)
+
+    # short rows are copied: a list entry each would take more than they do
+    given =
+      if row < 64,
+        do: for(<<r::binary-size(row) <- present>>, into: <<>>, do: <<0, r::binary>>),
+        else: for(<<r::binary-size(row) <- present>>, do: [0, r])
+
+    if full == height do
+      given
+    else
+      cut = binary_part(data, full * row, byte_size(data) - full * row)
+      blank = :binary.copy(<<0>>, row + 1)
+      [given, 0, cut, binary_part(blank, 0, row - byte_size(cut)), dup(blank, height - full - 1)]
+    end
+  end
+
+  defp dup(_blank, n) when n <= 0, do: []
+  defp dup(blank, n) when byte_size(blank) < 64, do: :binary.copy(blank, n)
+  defp dup(blank, n), do: List.duplicate(blank, n)
 
   defp compress(iodata, level) do
     z = :zlib.open()

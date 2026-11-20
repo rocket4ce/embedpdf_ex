@@ -82,6 +82,12 @@ defmodule EmbedPdf.Font.CFF do
   def standard_string(sid) when sid >= 0 and sid < 391, do: elem(@standard_tuple, sid)
   def standard_string(_), do: nil
 
+  @max_dict_bytes 16_384
+  # FDSelect addresses a font DICT with one byte
+  @max_fds 256
+  # local subroutines kept over all font DICTs (their offsets are held in memory)
+  @max_fd_subrs 262_144
+
   @doc "Whether the bytes look like a bare CFF font."
   def cff?(<<1, _minor, hdr, off, _::binary>>) when hdr >= 4 and off in 1..4, do: true
   def cff?(_), do: false
@@ -200,6 +206,12 @@ defmodule EmbedPdf.Font.CFF do
 
   @doc false
   def parse_dict(nil), do: %{}
+
+  # DICTs are a few hundred bytes; INDEX entries may overlap, so without a
+  # bound every entry could make the parser walk the whole file again
+  def parse_dict(bin) when byte_size(bin) > @max_dict_bytes,
+    do: dict(binary_part(bin, 0, @max_dict_bytes), [], %{})
+
   def parse_dict(bin), do: dict(bin, [], %{})
 
   defp dict(<<>>, _ops, acc), do: acc
@@ -429,24 +441,35 @@ defmodule EmbedPdf.Font.CFF do
 
   defp parse_fd_array(data, [off | _], top_matrix) when is_integer(off) do
     fd_index = index_at(data, off)
+    count = min(index_count(fd_index), @max_fds)
 
-    for i <- 0..(index_count(fd_index) - 1)//1 do
-      fd = fd_index |> index_get(i) |> parse_dict()
-      {_priv, subrs} = private(data, fd[18])
+    {fds, _left} =
+      Enum.map_reduce(0..(count - 1)//1, @max_fd_subrs, fn i, left ->
+        fd = fd_index |> index_get(i) |> parse_dict()
+        {_priv, subrs} = private(data, fd[18])
 
-      fd_matrix = matrix(fd[{12, 7}])
+        # font DICTs may all point at one Private DICT: past the budget an
+        # FD has no local subroutines
+        {subrs, left} =
+          case index_count(subrs) do
+            n when n <= left -> {subrs, left - n}
+            _ -> {{<<>>, {}}, left}
+          end
 
-      m =
-        cond do
-          fd_matrix && top_matrix -> multiply(fd_matrix, top_matrix)
-          fd_matrix -> fd_matrix
-          top_matrix -> top_matrix
-          true -> [0.001, 0.0, 0.0, 0.001, 0.0, 0.0]
-        end
+        fd_matrix = matrix(fd[{12, 7}])
 
-      %{subrs: subrs, matrix: m}
-    end
-    |> List.to_tuple()
+        m =
+          cond do
+            fd_matrix && top_matrix -> multiply(fd_matrix, top_matrix)
+            fd_matrix -> fd_matrix
+            top_matrix -> top_matrix
+            true -> [0.001, 0.0, 0.0, 0.001, 0.0, 0.0]
+          end
+
+        {%{subrs: subrs, matrix: m}, left}
+      end)
+
+    List.to_tuple(fds)
   end
 
   defp parse_fd_array(_, _, _), do: {}
@@ -475,11 +498,15 @@ defmodule EmbedPdf.Font.CFF do
         <<_::binary-size(3 * nranges), sentinel::16, _::binary>> = rest
         bounds = ranges |> Enum.drop(1) |> Enum.map(&elem(&1, 0)) |> Kernel.++([sentinel])
 
+        # one byte per glyph, so never more than the glyph count: ranges
+        # that go backwards and forwards would otherwise add 64 KB each
         ranges
         |> Enum.zip(bounds)
-        |> Enum.reduce([], fn {{first, fd}, stop}, acc ->
-          [:binary.copy(<<fd>>, max(stop - first, 0)) | acc]
+        |> Enum.reduce({[], 0}, fn {{first, fd}, stop}, {acc, len} ->
+          count = (stop - first) |> max(0) |> min(n - len)
+          {[:binary.copy(<<fd>>, count) | acc], len + count}
         end)
+        |> elem(0)
         |> Enum.reverse()
         |> IO.iodata_to_binary()
 
@@ -585,7 +612,14 @@ defmodule EmbedPdf.Font.CFF.Type2 do
   outline in charstring units; hints are skipped.
   """
 
+  # Operators and operands both count: a subroutine made only of numbers
+  # and called over and over would otherwise run (and grow the stack)
+  # without limit.
   @max_ops 100_000
+  # the width is settled by the first stack-clearing operator
+  @max_width_ops 2_000
+  # 48 in the Type 2 specification, 513 in CFF2
+  @max_stack 513
 
   @doc """
   Runs a charstring. `ctx` has `:gsubrs` and `:subrs` (CFF INDEX tuples)
@@ -610,7 +644,8 @@ defmodule EmbedPdf.Font.CFF.Type2 do
   """
   @spec width(binary(), map()) :: {:ok, number()} | :default | :unknown
   def width(cs, ctx) do
-    case exec(cs, new_state(), ctx, 0) do
+    # stops at the operator that settles the width: the outline is not needed
+    case exec(cs, %{new_state() | width_only?: true, max_ops: @max_width_ops}, ctx, 0) do
       {:error, _} -> :unknown
       {_, %{width: :default}} -> :default
       {_, %{width: w}} when is_number(w) -> {:ok, w}
@@ -630,6 +665,8 @@ defmodule EmbedPdf.Font.CFF.Type2 do
       path: [],
       open?: false,
       ops: 0,
+      max_ops: @max_ops,
+      width_only?: false,
       trans: %{},
       seac: nil
     }
@@ -654,8 +691,13 @@ defmodule EmbedPdf.Font.CFF.Type2 do
     end
   end
 
-  defp exec(_cs, %{ops: ops} = st, _ctx, _depth) when ops > @max_ops, do: {:error, st}
+  defp exec(_cs, %{ops: ops, max_ops: max} = st, _ctx, _depth) when ops > max, do: {:error, st}
   defp exec(_cs, st, _ctx, depth) when depth > 12, do: {:error, st}
+
+  defp exec(_cs, %{stack: stack} = st, _ctx, _depth) when length(stack) > @max_stack,
+    do: {:error, st}
+
+  defp exec(_cs, %{width_only?: true, width?: true} = st, _ctx, _depth), do: {:endchar, st}
   defp exec(<<>>, st, _ctx, _depth), do: {:eof, st}
 
   # numbers
@@ -880,7 +922,7 @@ defmodule EmbedPdf.Font.CFF.Type2 do
         {15, [b, a | r]} -> [bool(a == b) | r]
         {18, [_ | r]} -> r
         {23, r} -> [:rand.uniform() | r]
-        {24, [b, a | r]} -> [a * b | r]
+        {24, [b, a | r]} -> [mul(a, b) | r]
         {26, [a | r]} -> [:math.sqrt(max(a, 0)) | r]
         {27, [a | r]} -> [a, a | r]
         {28, [b, a | r]} -> [a, b | r]
@@ -907,9 +949,18 @@ defmodule EmbedPdf.Font.CFF.Type2 do
   defp bool(true), do: 1
   defp bool(false), do: 0
 
+  # charstring numbers are 16.16 fixed point: an integer product beyond that
+  # becomes a float, so repeated squaring cannot build huge integers
+  defp mul(a, b) do
+    case a * b do
+      p when is_integer(p) and (p > 0x7FFFFFFF or p < -0x80000000) -> p / 1
+      p -> p
+    end
+  end
+
   # ---------------------------------------------------------------- helpers
 
-  defp push(st, v), do: %{st | stack: [v | st.stack]}
+  defp push(st, v), do: %{st | stack: [v | st.stack], ops: st.ops + 1}
   defp args(st), do: Enum.reverse(st.stack)
   defp clear(st), do: %{st | stack: [], ops: st.ops + 1}
   defp width_done(st), do: %{st | width?: true}

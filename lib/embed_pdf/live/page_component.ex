@@ -191,7 +191,7 @@ defmodule EmbedPdf.Live.PageComponent do
 
   @doc false
   def safe_url(url) when is_binary(url) do
-    if String.match?(url, ~r/^(https?|mailto|tel):/i), do: url, else: "#"
+    if String.match?(url, ~r/\A(https?:\/\/|mailto:|tel:)[^\s]/i), do: url, else: "#"
   end
 
   def safe_url(_), do: "#"

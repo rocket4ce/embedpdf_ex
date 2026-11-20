@@ -24,7 +24,7 @@ defmodule EmbedPdf.Live.Viewer do
   use Phoenix.LiveView
 
   alias EmbedPdf.{I18n, Store, Text}
-  alias EmbedPdf.Live.{Features, Layout}
+  alias EmbedPdf.Live.{Access, Features, Layout}
   alias EmbedPdf.PDF.{Document, Page}
 
   @history_limit 50
@@ -33,11 +33,19 @@ defmodule EmbedPdf.Live.Viewer do
 
   @impl true
   def mount(params, session, socket) do
-    session = Map.merge(params_from(params), session || %{})
+    session =
+      params
+      |> params_from()
+      |> Map.merge(session || %{})
+      |> EmbedPdf.Live.unseal(socket.endpoint)
+
     viewer_id = "v" <> (16 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false))
 
-    if connected?(socket),
-      do: Phoenix.PubSub.subscribe(EmbedPdf.PubSub, "embed_pdf:viewer:" <> viewer_id)
+    if connected?(socket) do
+      Phoenix.PubSub.subscribe(EmbedPdf.PubSub, "embed_pdf:viewer:" <> viewer_id)
+      # this process holds the open document: a file cannot grow it without bound
+      EmbedPdf.Limits.limit_self()
+    end
 
     features = Features.resolve(session["features"] || %{}, session["read_only"] || false)
 
@@ -114,27 +122,8 @@ defmodule EmbedPdf.Live.Viewer do
         tab_state: %{},
         parent: socket.parent_pid
       )
-      |> allow_upload(:pdf,
-        accept: ~w(.pdf application/pdf),
-        max_entries: 1,
-        max_file_size: 300_000_000,
-        auto_upload: true,
-        progress: &handle_progress/3
-      )
-      |> allow_upload(:insert,
-        accept: ~w(.pdf application/pdf),
-        max_entries: 1,
-        max_file_size: 300_000_000,
-        auto_upload: true,
-        progress: &handle_progress/3
-      )
-      |> allow_upload(:attachment,
-        accept: :any,
-        max_entries: 1,
-        max_file_size: 100_000_000,
-        auto_upload: true,
-        progress: &handle_progress/3
-      )
+      |> allow_uploads(features)
+      |> attach_hook(:embed_pdf_access, :handle_event, &check_access/3)
 
     socket = load_initial(socket, session)
 
@@ -247,11 +236,10 @@ defmodule EmbedPdf.Live.Viewer do
 
       results =
         if entry && entry.meta[:signed?] do
-          try do
-            entry |> EmbedPdf.Output.bytes() |> EmbedPdf.Signatures.validate()
-          rescue
-            _ -> []
-          end
+          EmbedPdf.Limits.run_or(
+            fn -> entry |> EmbedPdf.Output.bytes() |> EmbedPdf.Signatures.validate() end,
+            []
+          )
         else
           []
         end
@@ -285,9 +273,53 @@ defmodule EmbedPdf.Live.Viewer do
   @impl true
   def render(assigns), do: EmbedPdf.Live.UI.viewer(assigns)
 
+  # ---------------------------------------------------------------- access
+
+  # a control that is hidden can still be driven over the socket, so the
+  # feature behind every event is checked here (EmbedPdf.Live.Access)
+  defp check_access(event, params, socket) do
+    if Access.allowed?(socket.assigns.features, event, params),
+      do: {:cont, socket},
+      else: {:halt, socket}
+  end
+
+  defp allow_uploads(socket, features) do
+    pdf_size = Application.get_env(:embedpdf_ex, :max_pdf_size, 100_000_000)
+    attachment_size = Application.get_env(:embedpdf_ex, :max_attachment_size, 50_000_000)
+
+    for {name, accept, size} <- [
+          {:pdf, ~w(.pdf application/pdf), pdf_size},
+          {:insert, ~w(.pdf application/pdf), pdf_size},
+          {:attachment, :any, attachment_size}
+        ],
+        Access.upload?(features, name),
+        reduce: socket do
+      socket ->
+        allow_upload(socket, name,
+          accept: accept,
+          max_entries: 1,
+          max_file_size: size,
+          auto_upload: true,
+          progress: &handle_progress/3
+        )
+    end
+  end
+
   # ---------------------------------------------------------------- uploads
 
-  def handle_progress(:pdf, entry, socket) do
+  # uploads are only allowed for features that are on; this guards the rest
+  def handle_progress(name, entry, socket) do
+    if Access.upload?(socket.assigns.features, name),
+      do: progress(name, entry, socket),
+      else: {:noreply, cancel_uploads(socket, name)}
+  end
+
+  defp cancel_uploads(socket, name) do
+    {done, pending} = uploaded_entries(socket, name)
+    Enum.reduce(done ++ pending, socket, &cancel_upload(&2, name, &1.ref))
+  end
+
+  defp progress(:pdf, entry, socket) do
     if entry.done? do
       [{bytes, name}] =
         consume_uploaded_entries(socket, :pdf, fn %{path: path}, e ->
@@ -300,7 +332,7 @@ defmodule EmbedPdf.Live.Viewer do
     end
   end
 
-  def handle_progress(:insert, entry, socket) do
+  defp progress(:insert, entry, socket) do
     if entry.done? do
       [bytes] =
         consume_uploaded_entries(socket, :insert, fn %{path: path}, _ ->
@@ -324,7 +356,7 @@ defmodule EmbedPdf.Live.Viewer do
     end
   end
 
-  def handle_progress(:attachment, entry, socket) do
+  defp progress(:attachment, entry, socket) do
     if entry.done? do
       [{bytes, name}] =
         consume_uploaded_entries(socket, :attachment, fn %{path: path}, e ->
@@ -456,7 +488,7 @@ defmodule EmbedPdf.Live.Viewer do
 
   def handle_event("panel", %{"side" => side, "panel" => panel}, socket) do
     key = if side == "left", do: :left, else: :right
-    panel = String.to_existing_atom(panel)
+    panel = Access.known(:panel, panel)
     panel = if Map.get(socket.assigns, key) == panel, do: nil, else: panel
     {:noreply, socket |> assign(key, panel) |> refresh_lists()}
   end
@@ -478,7 +510,7 @@ defmodule EmbedPdf.Live.Viewer do
   # ---------------------------------------------------------------- events: modes & tools
 
   def handle_event("mode", %{"mode" => m}, socket) do
-    mode = String.to_existing_atom(m)
+    mode = Access.known(:mode, m)
     socket = socket |> clear_tool() |> assign(mode: mode, tool: :pointer, menu: nil)
 
     socket =
@@ -493,7 +525,7 @@ defmodule EmbedPdf.Live.Viewer do
   end
 
   def handle_event("tool", %{"tool" => t}, socket) do
-    tool = String.to_existing_atom(t)
+    tool = Access.known(:tool, t)
     tool = if socket.assigns.tool == tool, do: :pointer, else: tool
     {:noreply, socket |> clear_tool() |> assign(tool: tool, menu: nil)}
   end
@@ -708,7 +740,7 @@ defmodule EmbedPdf.Live.Viewer do
 
   def handle_event("search", params, socket) do
     s = socket.assigns.search
-    query = Map.get(params, "q", s.query)
+    query = params |> Map.get("q", s.query) |> to_string() |> String.slice(0, 200)
     case? = Map.get(params, "case", if(s.case, do: "true", else: "false")) == "true"
     whole? = Map.get(params, "whole", if(s.whole, do: "true", else: "false")) == "true"
 
@@ -1093,14 +1125,28 @@ defmodule EmbedPdf.Live.Viewer do
         target =
           case params do
             %{"url" => url} when url != "" ->
-              {:uri, url}
+              # only addresses a reader may follow go into the file
+              url = String.trim(url)
+
+              if byte_size(url) <= 2048 and EmbedPdf.Live.PageComponent.safe_url(url) == url,
+                do: {:uri, url}
 
             %{"page" => n} ->
               {:page, (parse_int(n, 1) - 1) |> max(0) |> min(length(socket.assigns.sizes) - 1)}
+
+            _ ->
+              nil
           end
 
-        {doc, _} = EmbedPdf.Links.add(socket.assigns.doc, page, rect, target)
-        {:noreply, socket |> commit(doc, [page]) |> clear_tool() |> assign(dialog: nil)}
+        socket =
+          if target do
+            {doc, _} = EmbedPdf.Links.add(socket.assigns.doc, page, rect, target)
+            commit(socket, doc, [page])
+          else
+            socket
+          end
+
+        {:noreply, socket |> clear_tool() |> assign(dialog: nil)}
 
       _ ->
         {:noreply, socket}
@@ -1343,7 +1389,7 @@ defmodule EmbedPdf.Live.Viewer do
           contents: "Text",
           font_size: size,
           font_color: parse_color(st[:color] || "#e44234"),
-          font_family: String.to_existing_atom(st[:font] || "helvetica"),
+          font_family: font_family(st[:font]),
           opacity: st[:opacity] || 1.0
         }
 
@@ -1543,11 +1589,8 @@ defmodule EmbedPdf.Live.Viewer do
 
   defp safe_list_annotations(nil, _), do: []
 
-  defp safe_list_annotations(doc, page) do
-    EmbedPdf.Annotations.list(doc, page)
-  rescue
-    _ -> []
-  end
+  defp safe_list_annotations(doc, page),
+    do: EmbedPdf.Limits.run_or(fn -> EmbedPdf.Annotations.list(doc, page) end, [])
 
   defp redaction_rects(%{quad_points: [_ | _] = quads}), do: quads
   defp redaction_rects(%{rect: rect}), do: [rect]
@@ -1555,7 +1598,13 @@ defmodule EmbedPdf.Live.Viewer do
   # ---------------------------------------------------------------- history
 
   @doc false
-  def commit(socket, doc, pages, opts \\ []) do
+  def commit(socket, doc, pages, opts \\ [])
+
+  def commit(%{assigns: %{features: features}} = socket, doc, pages, opts) do
+    if Access.changes?(features), do: do_commit(socket, doc, pages, opts), else: socket
+  end
+
+  defp do_commit(socket, doc, pages, opts) do
     a = socket.assigns
     doc = normalize_doc(doc)
     rev = Store.update(a.doc_id, doc)
@@ -1656,6 +1705,10 @@ defmodule EmbedPdf.Live.Viewer do
   defp normalize_doc({doc, _}), do: doc
   defp normalize_doc(doc), do: doc
 
+  defp font_family("times"), do: :times
+  defp font_family("courier"), do: :courier
+  defp font_family(_), do: :helvetica
+
   # ---------------------------------------------------------------- layout & loading
 
   defp resize(socket, {w, h}) do
@@ -1716,7 +1769,12 @@ defmodule EmbedPdf.Live.Viewer do
   def page_text(socket_or_assigns, n) do
     a = assigns_of(socket_or_assigns)
     rev = Map.get(a.page_revs, n, 0)
-    Store.cached(a.doc_id, {:text, rev, n, a.rev}, fn -> Text.page(a.doc, n) end)
+    doc = a.doc
+
+    # a page too costly to read has no text layer rather than no viewer
+    Store.cached(a.doc_id, {:text, rev, n, a.rev}, fn ->
+      EmbedPdf.Limits.run_or(fn -> Text.page(doc, n) end, %Text.PageText{index: n})
+    end)
   end
 
   defp search_all(socket, query, opts) do
@@ -1824,10 +1882,14 @@ defmodule EmbedPdf.Live.Viewer do
         )
 
       k when k in ["Delete", "Backspace"] and a.field != nil and a.mode == :form ->
-        elem(EmbedPdf.Live.FormDesign.event("field_delete", %{}, socket), 1)
+        if Access.allowed?(a.features, "field_delete", %{}),
+          do: elem(EmbedPdf.Live.FormDesign.event("field_delete", %{}, socket), 1),
+          else: socket
 
       k when k in ["Delete", "Backspace"] and a.selected != nil ->
-        elem(handle_event("delete_annotation", %{}, socket), 1)
+        if Access.allowed?(a.features, "delete_annotation", %{}),
+          do: elem(handle_event("delete_annotation", %{}, socket), 1),
+          else: socket
 
       "?" ->
         assign(socket, dialog: :shortcuts)
@@ -1842,7 +1904,9 @@ defmodule EmbedPdf.Live.Viewer do
         assign(socket, tool: if(a.tool == :pan, do: :pointer, else: :pan))
 
       "f" ->
-        assign(socket, right: :search)
+        if Access.allowed?(a.features, "search", %{}),
+          do: assign(socket, right: :search),
+          else: socket
 
       "Enter" when a.points != [] ->
         finish_points(socket)
@@ -1935,11 +1999,8 @@ defmodule EmbedPdf.Live.Viewer do
     end
   end
 
-  defp safe(fun, default) do
-    fun.()
-  rescue
-    _ -> default
-  end
+  # lists read from the document, within EmbedPdf.Limits
+  defp safe(fun, default), do: EmbedPdf.Limits.run_or(fun, default)
 
   defp outline_ids(items),
     do: Enum.flat_map(items, fn i -> [i.id | outline_ids(i.children || [])] end)

@@ -101,11 +101,13 @@ defmodule EmbedPdf.Live.CSS do
   .epdf-sigbar{display:flex;align-items:center;gap:10px;padding:6px 12px;font-size:13px;border-bottom:1px solid var(--epdf-border);background:var(--epdf-surface-2)}
   .epdf-sigbar.is-valid{background:rgba(46,160,67,.12);color:#1a7f37}
   .epdf-sigbar.is-invalid{background:rgba(217,56,56,.1);color:var(--epdf-danger)}
+  .epdf-sigbar.is-modified{background:rgba(210,153,34,.16);color:#8a5a00}
   .epdf-sigbar .epdf-btn{margin-left:auto}
   .epdf-sig-head{display:flex;align-items:center;gap:8px}
   .epdf-sig-status{font-size:12px;font-weight:600;padding:1px 8px;border-radius:999px;background:var(--epdf-surface-2)}
   .epdf-sig.is-valid .epdf-sig-status{background:rgba(46,160,67,.15);color:#1a7f37}
   .epdf-sig.is-invalid .epdf-sig-status{background:rgba(217,56,56,.12);color:var(--epdf-danger)}
+  .epdf-sig.is-modified .epdf-sig-status{background:rgba(210,153,34,.2);color:#8a5a00}
   .epdf-signature-text input{width:180px}
 
   /* hint */

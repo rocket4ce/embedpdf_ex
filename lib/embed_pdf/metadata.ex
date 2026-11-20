@@ -108,6 +108,13 @@ defmodule EmbedPdf.Metadata do
 
   # ---------------------------------------------------------------- page labels
 
+  # What a label may grow to, whatever `/St` and `/P` say: Roman numerals
+  # stop at 4999, letters repeat 64 times (page 1664 of a range), a prefix
+  # keeps its first 256 bytes.
+  @max_roman 4999
+  @max_letters 64
+  @max_prefix 256
+
   @doc "The label of every page (`/PageLabels`), or `\"1\"`, `\"2\"`, … without labels."
   @spec page_labels(Document.t()) :: [String.t()]
   def page_labels(doc) do
@@ -119,8 +126,8 @@ defmodule EmbedPdf.Metadata do
           doc
           |> NameTree.number_entries(tree)
           |> Enum.filter(fn {k, _} -> is_integer(k) end)
-          |> Enum.map(fn {k, v} -> {k, Document.resolve(doc, v) || %{}} end)
           |> Enum.sort_by(&elem(&1, 0))
+          |> Enum.map(fn {k, v} -> {k, range(doc, Document.resolve(doc, v))} end)
 
         _ ->
           []
@@ -129,19 +136,53 @@ defmodule EmbedPdf.Metadata do
     if ranges == [] do
       Enum.map(1..count//1, &Integer.to_string/1)
     else
-      for i <- 0..(count - 1)//1 do
-        case ranges |> Enum.filter(fn {start, _} -> start <= i end) |> List.last() do
-          nil ->
-            Integer.to_string(i + 1)
-
-          {start, dict} ->
-            first = Document.resolve(doc, dict["St"]) || 1
-            n = i - start + first
-            prefix = Edit.untext(Document.resolve(doc, dict["P"])) || ""
-            prefix <> format(Document.resolve(doc, dict["S"]), n)
-        end
-      end
+      label_pages(0, count, nil, ranges, [])
     end
+  end
+
+  # the range of page i is the last one that starts at or before it: `ranges`
+  # is sorted, so it is found by moving along with the pages
+  defp label_pages(i, count, _current, _ranges, acc) when i >= count, do: Enum.reverse(acc)
+
+  defp label_pages(i, count, _current, [{start, _} = range | ranges], acc) when start <= i,
+    do: label_pages(i, count, range, ranges, acc)
+
+  defp label_pages(i, count, nil, ranges, acc),
+    do: label_pages(i + 1, count, nil, ranges, [Integer.to_string(i + 1) | acc])
+
+  defp label_pages(i, count, {start, {style, first, prefix}} = current, ranges, acc) do
+    label = prefix <> format(style, i - start + first)
+    label_pages(i + 1, count, current, ranges, [label | acc])
+  end
+
+  # `{style, first number, prefix}` of a label dictionary
+  defp range(doc, dict) when is_map(dict) and not is_struct(dict) do
+    first =
+      case Document.resolve(doc, dict["St"]) do
+        n when is_integer(n) -> n
+        _ -> 1
+      end
+
+    prefix = Edit.untext(Document.resolve(doc, dict["P"])) || ""
+    {Document.resolve(doc, dict["S"]), first, clip(prefix)}
+  end
+
+  defp range(_doc, _), do: {nil, 1, ""}
+
+  defp clip(prefix) when byte_size(prefix) <= @max_prefix, do: prefix
+
+  defp clip(prefix) do
+    cut = binary_part(prefix, 0, @max_prefix)
+    if String.valid?(prefix), do: whole_characters(cut, 3), else: cut
+  end
+
+  # a cut in the middle of a character leaves up to three bytes of it
+  defp whole_characters(text, 0), do: text
+
+  defp whole_characters(text, n) do
+    if String.valid?(text),
+      do: text,
+      else: whole_characters(binary_part(text, 0, byte_size(text) - 1), n - 1)
   end
 
   defp format("D", n), do: Integer.to_string(n)
@@ -171,7 +212,7 @@ defmodule EmbedPdf.Metadata do
 
   defp roman(n) do
     {out, _} =
-      Enum.reduce(@roman, {"", n}, fn {v, s}, {acc, rest} ->
+      Enum.reduce(@roman, {"", min(n, @max_roman)}, fn {v, s}, {acc, rest} ->
         {acc <> String.duplicate(s, div(rest, v)), rem(rest, v)}
       end)
 
@@ -183,6 +224,6 @@ defmodule EmbedPdf.Metadata do
 
   defp letters(n) do
     letter = <<?A + rem(n - 1, 26)>>
-    String.duplicate(letter, div(n - 1, 26) + 1)
+    String.duplicate(letter, min(div(n - 1, 26) + 1, @max_letters))
   end
 end

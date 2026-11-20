@@ -413,6 +413,9 @@ defmodule EmbedPdf.Forms do
         inherited_da(doc, field.id) ||
         Edit.untext(Document.resolve(doc, form["DA"])) || "/Helv 0 Tf 0 g"
 
+    # the patterns below backtrack: a real /DA is a few dozen bytes
+    da = binary_part(da, 0, min(byte_size(da), 1024))
+
     {name, size} =
       case Regex.run(~r{/([^\s/]+)\s+([\d.]+)\s+Tf}, da) do
         [_, n, s] -> {n, s |> Float.parse() |> elem(0)}

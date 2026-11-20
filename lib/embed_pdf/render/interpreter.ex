@@ -55,15 +55,120 @@ defmodule EmbedPdf.Render.Interpreter do
 
   The emitter is `fun(event, acc) -> acc`; the interpreter threads `acc`
   through and returns it.
+
+  ## Limits
+
+  A page gets a work budget (`new_budget/0`): one unit per operator and per
+  glyph shown, more for what costs more (nested content streams by their
+  size, images and patterns by theirs, colors by their tint function).
+  Form XObjects, Type 3 glyph procedures and the interpreters an emitter
+  starts while handling an event (soft masks, patterns) all draw on the
+  same budget and nesting depth; pass `budget:` to share it between runs
+  that follow one another (a page and its annotation appearances). When
+  the budget runs out interpretation stops quietly and what was drawn so
+  far is returned.
+
+      config :embedpdf_ex, max_page_operators: 3_000_000
   """
 
   alias EmbedPdf.Font
   alias EmbedPdf.PDF.{Content, Document, Page, Stream}
   alias EmbedPdf.Render.{ColorSpace, GState, Matrix}
 
-  @max_depth 24
+  # content streams nested this deep (forms, glyph procedures, patterns,
+  # soft masks, counted together) are not drawn
+  @max_depth 12
+  # clipping paths in force at once; further ones are ignored
+  @max_clips 256
+  @max_dash 32
+  # forms and Type 3 glyph procedures kept parsed: the size of one, and of
+  # all of them, in bytes of content
+  @max_kept_stream 16_384
+  @max_kept_bytes 1_000_000
+  @default_operators 3_000_000
+  @default_image_bytes 512_000_000
+  @budget_key {__MODULE__, :budget}
 
   @type emit :: (tuple(), term() -> term())
+  @opaque budget :: :counters.counters_ref()
+
+  # ---------------------------------------------------------------- budget
+
+  @doc """
+  A fresh work budget: `:max_page_operators` units of work (default
+  #{@default_operators}) and `:max_page_image_bytes` of decoded image
+  samples (default #{@default_image_bytes}).
+  """
+  @spec new_budget() :: budget()
+  def new_budget do
+    # 1: work left, 2: depth for the next interpreter started, 3: image bytes left
+    budget = :counters.new(3, [])
+    :counters.put(budget, 1, limit(:max_page_operators, @default_operators))
+    :counters.put(budget, 3, limit(:max_page_image_bytes, @default_image_bytes))
+    budget
+  end
+
+  defp limit(key, default) do
+    case Application.get_env(:embedpdf_ex, key, default) do
+      n when is_integer(n) and n > 0 -> n
+      _ -> default
+    end
+  end
+
+  @doc """
+  Charges `units` of work to the budget of the interpreter running in this
+  process, for work done on its behalf while handling an event. Returns
+  `false` once the budget is spent (always `true` outside a run).
+  """
+  @spec charge(non_neg_integer()) :: boolean()
+  def charge(units) do
+    case Process.get(@budget_key) do
+      nil -> true
+      budget -> spend(budget, 1, units)
+    end
+  end
+
+  @doc """
+  Charges decoded image bytes to the running interpreter's budget; `false`
+  when the page has used up its share.
+  """
+  @spec charge_image(non_neg_integer()) :: boolean()
+  def charge_image(bytes) do
+    case Process.get(@budget_key) do
+      nil -> true
+      budget -> spend(budget, 3, bytes)
+    end
+  end
+
+  defp spend(budget, slot, units) do
+    if :counters.get(budget, slot) > 0 do
+      :counters.sub(budget, slot, max(units, 0))
+      true
+    else
+      false
+    end
+  end
+
+  # one unit per operator; false when nothing is left
+  defp spend(%{budget: budget}, units), do: spend(budget, 1, units)
+
+  # Makes the state's budget the process's current one while `fun` runs, so
+  # that interpreters started from event handlers continue from it.
+  defp scoped(state, fun) do
+    budget = state.budget
+    previous = Process.put(@budget_key, budget)
+    outer_depth = :counters.get(budget, 2)
+    :counters.put(budget, 2, state.depth + 1)
+
+    try do
+      fun.(state)
+    after
+      :counters.put(budget, 2, outer_depth)
+      if previous, do: Process.put(@budget_key, previous), else: Process.delete(@budget_key)
+    end
+  end
+
+  defp publish_depth(state, depth), do: :counters.put(state.budget, 2, depth + 1)
 
   @doc """
   Runs a page's content. Options:
@@ -71,6 +176,8 @@ defmodule EmbedPdf.Render.Interpreter do
     * `:ctm` – base transform (default identity: PDF user space)
     * `:text_only` – skip images, shadings and Type 3 glyph procedures
     * `:gs` – a `GState` to start from (its `ctm` and `clip` are replaced)
+    * `:budget` – a budget from `new_budget/0` to draw on (default: the one
+      of the interpreter this run is nested in, or a fresh one)
   """
   @spec run_page(Document.t(), Page.t(), emit(), term(), keyword()) :: term()
   def run_page(doc, %Page{} = page, emit, acc, opts \\ []) do
@@ -82,9 +189,23 @@ defmodule EmbedPdf.Render.Interpreter do
   @spec run(Document.t(), binary(), map(), Matrix.t(), emit(), term(), keyword()) :: term()
   def run(doc, content, resources, ctm, emit, acc, opts \\ []) do
     state = new_state(doc, resources, ctm, emit, acc, opts)
-    state = exec(Content.parse(content), state)
-    state.acc
+    # 0 for a page; inside another interpreter (a pattern cell) one level down
+    depth = :counters.get(state.budget, 2)
+    state = %{state | depth: depth, parsed: if(depth == 0, do: MapSet.new())}
+
+    if state.depth > @max_depth or not nested_stream(state, content) do
+      acc
+    else
+      scoped(state, fn state -> exec(parse_within(state, content), state) end).acc
+    end
   end
+
+  # a content stream run from inside another one is paid for by its size
+  defp nested_stream(%{depth: 0}, _content), do: true
+  defp nested_stream(state, content), do: spend(state, stream_cost(content))
+
+  # reading a stream costs by the byte, whatever it then has to run
+  defp stream_cost(content), do: 1 + div(byte_size(content), 4)
 
   @doc """
   Runs a form XObject (such as an annotation appearance) drawn with
@@ -93,8 +214,9 @@ defmodule EmbedPdf.Render.Interpreter do
   @spec run_form(Document.t(), Stream.t(), Matrix.t(), emit(), term(), keyword()) :: term()
   def run_form(doc, %Stream{} = form, ctm, emit, acc, opts \\ []) do
     state = new_state(doc, %{}, ctm, emit, acc, opts)
-    state = draw_form(state, form, nil)
-    state.acc
+    # the form itself is the nested level
+    state = %{state | depth: max(:counters.get(state.budget, 2) - 1, 0)}
+    scoped(state, fn state -> draw_form(state, form, nil) end).acc
   end
 
   defp new_state(doc, resources, ctm, emit, acc, opts) do
@@ -118,20 +240,35 @@ defmodule EmbedPdf.Render.Interpreter do
       emit: emit,
       acc: acc,
       fonts: Keyword.get(opts, :fonts, %{}),
+      # parsed color spaces by {resources id, name}
+      spaces: %{},
+      res_id: :root,
       depth: 0,
       forms: MapSet.new(),
+      # the forms a page has read (nil: this is not a page's own content)
+      parsed: nil,
+      # forms and Type 3 glyph procedures kept parsed, and their size so far
+      streams: {%{}, 0},
       oc: oc_config(doc),
       mc: [],
+      budget: Keyword.get(opts, :budget) || Process.get(@budget_key) || new_budget(),
       opts: opts
     }
   end
 
   defp exec(ops, state) do
-    Enum.reduce(ops, state, fn {op, args}, st ->
-      try do
-        op(op, args, st)
-      rescue
-        _ -> st
+    Enum.reduce_while(ops, state, fn {op, args}, st ->
+      if spend(st, 1) do
+        {:cont,
+         try do
+           op(op, args, st)
+         rescue
+           _ ->
+             publish_depth(st, st.depth)
+             st
+         end}
+      else
+        {:halt, st}
       end
     end)
   end
@@ -157,7 +294,7 @@ defmodule EmbedPdf.Render.Interpreter do
   defp op("M", [m], s), do: put_gs(s, :miter_limit, m / 1)
 
   defp op("d", [arr, phase], s) when is_list(arr),
-    do: put_gs(s, :dash, {Enum.filter(arr, &is_number/1), phase})
+    do: put_gs(s, :dash, {arr |> Enum.filter(&is_number/1) |> Enum.take(@max_dash), phase})
 
   defp op("ri", _, s), do: s
   defp op("i", _, s), do: s
@@ -213,8 +350,16 @@ defmodule EmbedPdf.Render.Interpreter do
 
   # ---------------------------------------------------------------- color
 
-  defp op("CS", [name], s), do: set_space(s, :stroke, ColorSpace.parse(s.doc, name, s.resources))
-  defp op("cs", [name], s), do: set_space(s, :fill, ColorSpace.parse(s.doc, name, s.resources))
+  defp op("CS", [name], s) do
+    {cs, s} = color_space(s, name)
+    set_space(s, :stroke, cs)
+  end
+
+  defp op("cs", [name], s) do
+    {cs, s} = color_space(s, name)
+    set_space(s, :fill, cs)
+  end
+
   defp op(o, args, s) when o in ["SC", "SCN"], do: set_color(s, :stroke, args)
   defp op(o, args, s) when o in ["sc", "scn"], do: set_color(s, :fill, args)
   defp op("G", [g], s), do: s |> set_space(:stroke, :gray) |> set_color(:stroke, [g])
@@ -297,7 +442,7 @@ defmodule EmbedPdf.Render.Interpreter do
           "Image" ->
             if s.opts[:text_only] == true or not oc_visible?(s, dict["OC"]),
               do: s,
-              else: emit(s, {:image, %{image: xobj, gs: s.gs, resources: s.resources}})
+              else: emit_image(s, xobj, byte_size(xobj.raw))
 
           "Form" ->
             ref = get_in_resources_ref(s, "XObject", name)
@@ -313,9 +458,7 @@ defmodule EmbedPdf.Render.Interpreter do
   end
 
   defp op("BI", [image], s) do
-    if s.opts[:text_only],
-      do: s,
-      else: emit(s, {:image, %{image: image, gs: s.gs, resources: s.resources}})
+    if s.opts[:text_only], do: s, else: emit_image(s, image, inline_size(image))
   end
 
   defp op("sh", [name], s) do
@@ -331,7 +474,9 @@ defmodule EmbedPdf.Render.Interpreter do
 
   # ---------------------------------------------------------------- marked content
 
-  defp op("BMC", _, s), do: %{s | mc: [true | s.mc]}
+  # each entry says whether content is visible at that level, the enclosing
+  # ones included
+  defp op("BMC", _, s), do: %{s | mc: [visible?(s) | s.mc]}
 
   defp op("BDC", [tag, props], s) do
     visible =
@@ -342,7 +487,7 @@ defmodule EmbedPdf.Render.Interpreter do
         true
       end
 
-    %{s | mc: [visible | s.mc]}
+    %{s | mc: [visible and visible?(s) | s.mc]}
   end
 
   defp op("EMC", _, %{mc: [_ | rest]} = s), do: %{s | mc: rest}
@@ -361,26 +506,84 @@ defmodule EmbedPdf.Render.Interpreter do
 
   defp put_gs(s, key, value), do: %{s | gs: Map.put(s.gs, key, value)}
 
+  # the emitter identifies images and patterns by their bytes: drawing one
+  # costs in proportion
+  defp emit_image(s, image, size) do
+    if spend(s, div(size, 1024)),
+      do: emit(s, {:image, %{image: image, gs: s.gs, resources: s.resources}}),
+      else: s
+  end
+
+  defp inline_size(%{data: data}) when is_binary(data), do: byte_size(data)
+  defp inline_size(_), do: 0
+
+  defp pattern_cost(_s, nil), do: 0
+  defp pattern_cost(_s, {%Stream{raw: raw}, _tint}), do: div(byte_size(raw), 1024)
+
+  defp pattern_cost(s, {%{"Shading" => shading}, _tint}) do
+    case Document.resolve(s.doc, shading) do
+      %Stream{raw: raw} -> div(byte_size(raw), 1024)
+      _ -> 0
+    end
+  end
+
+  defp pattern_cost(_s, _), do: 0
+
+  defp push_clip(clip, entry) do
+    if length(clip) < @max_clips, do: clip ++ [entry], else: clip
+  end
+
+  defp color_space(%{res_id: nil} = s, name),
+    do: {ColorSpace.parse(s.doc, name, s.resources), s}
+
+  defp color_space(s, name) do
+    key = {s.res_id, name}
+
+    case s.spaces do
+      %{^key => cs} ->
+        {cs, s}
+
+      _ ->
+        cs = ColorSpace.parse(s.doc, name, s.resources)
+        {cs, %{s | spaces: Map.put(s.spaces, key, cs)}}
+    end
+  end
+
+  # Names the resource dictionary a content stream brings along, for the
+  # color space cache (nil: not known to be the same one next time).
+  defp resources_id({:ref, n, _}, _owner), do: {:res, n}
+  defp resources_id(_direct, nil), do: nil
+  defp resources_id(_direct, owner), do: owner
+
   defp close_path(s), do: %{s | path: [:h | s.path], cp: s.start}
 
   defp paint(s, fill, stroke?) do
     path = Enum.reverse(s.path)
 
     s =
-      if path != [] and (fill != nil or stroke?),
-        do: emit(s, {:path, %{path: path, fill: fill, stroke: stroke?, gs: s.gs}}),
-        else: s
+      if path != [] and (fill != nil or stroke?) do
+        patterns =
+          if(fill, do: pattern_cost(s, s.gs.fill_pattern), else: 0) +
+            if stroke?, do: pattern_cost(s, s.gs.stroke_pattern), else: 0
+
+        if patterns == 0 or spend(s, patterns),
+          do: emit(s, {:path, %{path: path, fill: fill, stroke: stroke?, gs: s.gs}}),
+          else: s
+      else
+        s
+      end
 
     s =
       case s.clip_rule do
         nil -> s
-        rule -> put_gs(s, :clip, s.gs.clip ++ [{path, rule, s.gs.ctm}])
+        rule -> put_gs(s, :clip, push_clip(s.gs.clip, {path, rule, s.gs.ctm}))
       end
 
     %{s | path: [], clip_rule: nil}
   end
 
   defp set_space(s, which, cs) do
+    spend(s, color_cost(cs))
     color = initial_color(cs)
 
     case which do
@@ -389,11 +592,16 @@ defmodule EmbedPdf.Render.Interpreter do
     end
   end
 
+  # converting a color runs the space's tint function
+  defp color_cost(cs) when is_atom(cs), do: 0
+  defp color_cost(cs), do: div(ColorSpace.cost(cs), 16)
+
   defp initial_color({:pattern, _}), do: {0.0, 0.0, 0.0}
   defp initial_color(cs), do: ColorSpace.to_rgb(cs, ColorSpace.initial(cs))
 
   defp set_color(s, which, args) do
     cs = if which == :fill, do: s.gs.fill_cs, else: s.gs.stroke_cs
+    spend(s, color_cost(cs))
     nums = Enum.filter(args, &is_number/1)
 
     {color, pattern} =
@@ -427,9 +635,9 @@ defmodule EmbedPdf.Render.Interpreter do
     end
   end
 
-  defp font_for(s, name) do
-    ref = get_in_resources_ref(s, "Font", name)
+  defp font_for(s, name), do: load_font(s, get_in_resources_ref(s, "Font", name))
 
+  defp load_font(s, ref) do
     key =
       case ref do
         {:ref, n, _} -> n
@@ -471,7 +679,8 @@ defmodule EmbedPdf.Render.Interpreter do
           put_gs(st, :miter_limit, m / 1)
 
         {"D", [arr, phase]} when is_list(arr) ->
-          put_gs(st, :dash, {Enum.map(arr, &Document.resolve(doc, &1)), phase})
+          dashes = arr |> Enum.take(@max_dash) |> Enum.map(&Document.resolve(doc, &1))
+          put_gs(st, :dash, {dashes, phase})
 
         {"CA", a} when is_number(a) ->
           put_gs(st, :stroke_alpha, a / 1)
@@ -490,6 +699,10 @@ defmodule EmbedPdf.Render.Interpreter do
 
         {"SMask", %{} = sm} ->
           put_gs(st, :soft_mask, Map.put(sm, "__ctm", st.gs.ctm))
+
+        {"Font", [{:ref, _, _} = ref, size]} ->
+          {font, st} = load_font(st, ref)
+          %{st | gs: %{st.gs | font: font, font_size: size / 1}}
 
         {"Font", [ref, size]} ->
           font = Font.load(doc, ref)
@@ -511,70 +724,85 @@ defmodule EmbedPdf.Render.Interpreter do
   end
 
   defp show(s, str) do
+    Enum.reduce(Font.decode(s.gs.font, str), s, fn glyph, st ->
+      if spend(st, 1), do: show_glyph(st, s, glyph), else: st
+    end)
+  end
+
+  # `s` is the state the string started with
+  defp show_glyph(st, s, {code, _cid, _uni, w0, n} = glyph) do
     gs = s.gs
     font = gs.font
     fs = gs.font_size
     th = gs.h_scale
 
-    Enum.reduce(Font.decode(font, str), s, fn {code, _cid, _uni, w0, n} = glyph, st ->
-      trm =
-        [fs * th, 0.0, 0.0, fs, 0.0, gs.rise]
-        |> Matrix.multiply(st.tm)
-        |> Matrix.multiply(gs.ctm)
+    trm =
+      [fs * th, 0.0, 0.0, fs, 0.0, gs.rise]
+      |> Matrix.multiply(st.tm)
+      |> Matrix.multiply(gs.ctm)
 
-      st = emit(st, {:glyph, %{font: font, glyph: glyph, trm: trm, gs: st.gs}})
+    st = emit(st, {:glyph, %{font: font, glyph: glyph, trm: trm, gs: st.gs}})
 
-      st =
-        if font.type == "Type3" and s.opts[:text_only] != true,
-          do: draw_type3(st, font, code, trm),
-          else: st
+    st =
+      if font.type == "Type3" and s.opts[:text_only] != true,
+        do: draw_type3(st, font, code, trm),
+        else: st
 
-      word = if code == 32 and n == 1, do: gs.word_spacing, else: 0.0
+    word = if code == 32 and n == 1, do: gs.word_spacing, else: 0.0
 
-      if font.vertical? do
-        ty = -(1.0 * fs) + gs.char_spacing + word
-        %{st | tm: Matrix.multiply(Matrix.translate(0, ty), st.tm)}
-      else
-        tx = (w0 * fs + gs.char_spacing + word) * th
-        %{st | tm: Matrix.multiply(Matrix.translate(tx, 0), st.tm)}
-      end
-    end)
+    if font.vertical? do
+      ty = -(1.0 * fs) + gs.char_spacing + word
+      %{st | tm: Matrix.multiply(Matrix.translate(0, ty), st.tm)}
+    else
+      tx = (w0 * fs + gs.char_spacing + word) * th
+      %{st | tm: Matrix.multiply(Matrix.translate(tx, 0), st.tm)}
+    end
   end
 
   defp draw_type3(s, font, code, trm) do
     case Font.type3_proc(font, code) do
       {proc, res} when s.depth < @max_depth ->
-        data = Document.stream_data(s.doc, proc) || ""
-        ctm = Matrix.multiply(font.font_matrix, trm)
-        saved = {s.gs, s.stack, s.resources, s.path, s.tm, s.tlm, s.mc}
-
-        inner = %{
-          s
-          | gs: %{s.gs | ctm: ctm, base_ctm: ctm},
-            stack: [],
-            resources: res || s.resources,
-            path: [],
-            depth: s.depth + 1
-        }
-
-        inner = exec(Content.parse(data), inner)
-        {gs, stack, resources, path, tm, tlm, mc} = saved
-
-        %{
-          inner
-          | gs: gs,
-            stack: stack,
-            resources: resources,
-            path: path,
-            tm: tm,
-            tlm: tlm,
-            mc: mc,
-            depth: s.depth
-        }
+        case stream_ops(s, font.id && {:glyph, font.id, code}, proc) do
+          {nil, s} -> s
+          {ops, s} -> run_type3(s, font, ops, res, trm)
+        end
 
       _ ->
         s
     end
+  end
+
+  defp run_type3(s, font, ops, res, trm) do
+    ctm = Matrix.multiply(font.font_matrix, trm)
+    saved = {s.gs, s.stack, s.resources, s.res_id, s.path, s.tm, s.tlm, s.mc}
+
+    inner = %{
+      s
+      | gs: %{s.gs | ctm: ctm, base_ctm: ctm},
+        stack: [],
+        resources: res || s.resources,
+        res_id: if(res, do: font.id && {:t3, font.id}, else: s.res_id),
+        path: [],
+        depth: s.depth + 1
+    }
+
+    publish_depth(inner, inner.depth)
+    inner = exec(ops, inner)
+    publish_depth(s, s.depth)
+    {gs, stack, resources, res_id, path, tm, tlm, mc} = saved
+
+    %{
+      inner
+      | gs: gs,
+        stack: stack,
+        resources: resources,
+        res_id: res_id,
+        path: path,
+        tm: tm,
+        tlm: tlm,
+        mc: mc,
+        depth: s.depth
+    }
   end
 
   # ---------------------------------------------------------------- forms
@@ -595,7 +823,14 @@ defmodule EmbedPdf.Render.Interpreter do
     matrix = Matrix.from_pdf(Document.resolve(doc, dict["Matrix"]))
     ctm = Matrix.multiply(matrix, s.gs.ctm)
     bbox = Page.normalize_rect(Document.resolve(doc, dict["BBox"]), doc)
-    resources = Document.resolve(doc, dict["Resources"]) || s.resources
+    own_resources = Document.resolve(doc, dict["Resources"])
+    resources = own_resources || s.resources
+
+    res_id =
+      if own_resources,
+        do: resources_id(dict["Resources"], key && {:form, key}),
+        else: s.res_id
+
     group? = match?(%{"S" => "Transparency"}, Document.resolve(doc, dict["Group"]))
 
     gs = %{s.gs | ctm: ctm, base_ctm: ctm}
@@ -603,19 +838,20 @@ defmodule EmbedPdf.Render.Interpreter do
     gs =
       case bbox do
         {x0, y0, x1, y1} ->
-          %{gs | clip: gs.clip ++ [{[{:re, x0, y0, x1 - x0, y1 - y0}], :nonzero, ctm}]}
+          %{gs | clip: push_clip(gs.clip, {[{:re, x0, y0, x1 - x0, y1 - y0}], :nonzero, ctm})}
 
         nil ->
           gs
       end
 
-    saved = {s.gs, s.stack, s.resources, s.path, s.tm, s.tlm, s.forms, s.mc}
+    saved = {s.gs, s.stack, s.resources, s.res_id, s.path, s.tm, s.tlm, s.forms, s.mc}
 
     inner = %{
       s
       | gs: gs,
         stack: [],
         resources: resources,
+        res_id: res_id,
         path: [],
         depth: s.depth + 1,
         forms: if(key, do: MapSet.put(s.forms, key), else: s.forms),
@@ -634,16 +870,25 @@ defmodule EmbedPdf.Render.Interpreter do
         },
         else: inner
 
-    inner = exec(Content.parse(Document.stream_data(doc, form) || ""), inner)
+    publish_depth(inner, inner.depth)
+
+    inner =
+      case stream_ops(inner, key && {:form, key}, form) do
+        {nil, inner} -> inner
+        {ops, inner} -> exec(ops, inner)
+      end
+
+    publish_depth(s, s.depth)
     inner = if group?, do: emit(%{inner | mc: s.mc}, {:group_end, %{gs: gs}}), else: inner
 
-    {g, stack, res, path, tm, tlm, forms, mc} = saved
+    {g, stack, res, res_id, path, tm, tlm, forms, mc} = saved
 
     %{
       inner
       | gs: g,
         stack: stack,
         resources: res,
+        res_id: res_id,
         path: path,
         tm: tm,
         tlm: tlm,
@@ -652,6 +897,49 @@ defmodule EmbedPdf.Render.Interpreter do
         mc: mc
     }
   end
+
+  # Parses no more operations than the budget still lets run: the parsed
+  # list is several times the size of its stream.
+  defp parse_within(%{budget: budget}, content),
+    do: Content.parse(content, max_ops: max(:counters.get(budget, 1), 0) + 1)
+
+  # The operations of a form or a glyph procedure, or nil when the budget
+  # does not let it be read. `key` names the stream (nil: not known to be
+  # the same one next time); small ones are kept parsed, so that a symbol
+  # or a glyph drawn a thousand times is read once.
+  defp stream_ops(s, key, stream) do
+    case s.streams do
+      {%{^key => ops}, _size} when key != nil ->
+        {ops, s}
+
+      {kept, size} ->
+        content = Document.stream_data(s.doc, stream) || ""
+        {cost, s} = read_cost(s, key, content)
+
+        if spend(s, cost) do
+          ops = parse_within(s, content)
+          size = size + byte_size(content)
+
+          if key != nil and byte_size(content) <= @max_kept_stream and size <= @max_kept_bytes,
+            do: {ops, %{s | streams: {Map.put(kept, key, ops), size}}},
+            else: {ops, s}
+        else
+          {nil, s}
+        end
+    end
+  end
+
+  # A page reads each of its forms once for nothing, as it does its own
+  # content; reading one again, or reading anything on behalf of what may be
+  # drawn many times over (a glyph, a pattern, a soft mask, an appearance),
+  # is paid for by its size.
+  defp read_cost(%{parsed: %MapSet{} = parsed} = s, {:form, _} = key, content) do
+    if MapSet.member?(parsed, key),
+      do: {stream_cost(content), s},
+      else: {1, %{s | parsed: MapSet.put(parsed, key)}}
+  end
+
+  defp read_cost(s, _key, content), do: {stream_cost(content), s}
 
   # ---------------------------------------------------------------- optional content
 
@@ -680,7 +968,8 @@ defmodule EmbedPdf.Render.Interpreter do
   defp ref_key({:ref, n, _}), do: n
   defp ref_key(_), do: nil
 
-  defp visible?(%{mc: mc}), do: Enum.all?(mc)
+  defp visible?(%{mc: [false | _]}), do: false
+  defp visible?(_), do: true
 
   defp oc_visible?(_s, nil), do: true
 
@@ -694,6 +983,7 @@ defmodule EmbedPdf.Render.Interpreter do
       case dict do
         %{"Type" => "OCMD"} ->
           ocgs = s.doc |> Document.resolve(dict["OCGs"]) |> List.wrap() |> Enum.map(&ref_key/1)
+          spend(s, div(length(ocgs), 16))
           policy = Document.resolve(s.doc, dict["P"]) || "AnyOn"
           states = Enum.map(ocgs, &(not MapSet.member?(s.oc, &1)))
 

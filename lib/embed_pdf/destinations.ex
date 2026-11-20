@@ -8,7 +8,7 @@ defmodule EmbedPdf.Destinations do
   nil ("keep the current value").
   """
 
-  alias EmbedPdf.PDF.{Document, NameTree, TextString}
+  alias EmbedPdf.PDF.{Document, NameTree, Page, TextString}
 
   @fits %{
     "XYZ" => :xyz,
@@ -21,43 +21,88 @@ defmodule EmbedPdf.Destinations do
     "FitBV" => :fit_bv
   }
 
-  @doc "Resolves an explicit or named destination."
-  @spec resolve(Document.t(), term()) :: map() | nil
-  def resolve(doc, dest), do: do_resolve(doc, dest, 0)
+  @doc """
+  What resolving destinations needs from the document, looked up once: the
+  named destinations and the page of every page object.
 
-  defp do_resolve(_doc, _dest, depth) when depth > 8, do: nil
+  Pass it to `resolve/3`, `named/3`, `action/3` or `of_item/3` when many
+  destinations of one document are resolved (an outline, the links of a
+  page): without it every named destination walks the whole name tree and
+  every page reference the whole page list.
+  """
+  @spec context(Document.t()) :: map()
+  def context(doc) do
+    catalog = Document.catalog(doc)
 
-  defp do_resolve(doc, {:ref, _, _} = ref, depth) do
+    dests =
+      case Document.get(doc, catalog, "Dests") do
+        %{} = dests -> dests
+        _ -> %{}
+      end
+
+    names =
+      case Document.get_in(doc, catalog, ["Names", "Dests"]) do
+        %{} = tree ->
+          # the first entry of a name that has a value, as NameTree.lookup/3
+          doc
+          |> NameTree.entries(tree)
+          |> Enum.reduce(%{}, fn {k, v}, acc -> if v, do: Map.put_new(acc, k, v), else: acc end)
+
+        _ ->
+          %{}
+      end
+
+    {pages, count} =
+      Enum.reduce(doc.pages, {%{}, 0}, fn
+        %Page{ref: {:ref, n, _}}, {acc, i} -> {Map.put_new(acc, n, i), i + 1}
+        _, {acc, i} -> {acc, i + 1}
+      end)
+
+    %{dests: dests, names: names, pages: pages, page_count: count}
+  end
+
+  @doc "Resolves an explicit or named destination (see `context/1` for `ctx`)."
+  @spec resolve(Document.t(), term(), map() | nil) :: map() | nil
+  def resolve(doc, dest, ctx \\ nil), do: do_resolve(doc, dest, 0, ctx)
+
+  defp do_resolve(_doc, _dest, depth, _ctx) when depth > 8, do: nil
+
+  defp do_resolve(doc, {:ref, _, _} = ref, depth, ctx) do
     case Document.resolve(doc, ref) do
-      list when is_list(list) -> explicit(doc, list)
-      %{"D" => d} -> do_resolve(doc, d, depth + 1)
-      other when is_binary(other) or is_tuple(other) -> do_resolve(doc, other, depth + 1)
+      list when is_list(list) -> explicit(doc, list, ctx)
+      %{"D" => d} -> do_resolve(doc, d, depth + 1, ctx)
+      other when is_binary(other) or is_tuple(other) -> do_resolve(doc, other, depth + 1, ctx)
       _ -> nil
     end
   end
 
-  defp do_resolve(doc, list, _depth) when is_list(list), do: explicit(doc, list)
-  defp do_resolve(doc, %{"D" => d}, depth), do: do_resolve(doc, d, depth + 1)
+  defp do_resolve(doc, list, _depth, ctx) when is_list(list), do: explicit(doc, list, ctx)
+  defp do_resolve(doc, %{"D" => d}, depth, ctx), do: do_resolve(doc, d, depth + 1, ctx)
 
-  defp do_resolve(doc, name, depth) when is_binary(name) do
-    case named(doc, name) do
+  defp do_resolve(doc, name, depth, ctx) when is_binary(name) do
+    case named(doc, name, ctx) do
       nil -> nil
-      value -> do_resolve(doc, value, depth + 1)
+      value -> do_resolve(doc, value, depth + 1, ctx)
     end
   end
 
-  defp do_resolve(doc, {:string, name}, depth) do
-    case named(doc, name) do
+  defp do_resolve(doc, {:string, name}, depth, ctx) do
+    case named(doc, name, ctx) do
       nil -> nil
-      value -> do_resolve(doc, value, depth + 1)
+      value -> do_resolve(doc, value, depth + 1, ctx)
     end
   end
 
-  defp do_resolve(_doc, _, _), do: nil
+  defp do_resolve(_doc, _, _, _), do: nil
 
   @doc "Looks up a named destination (in `/Dests` and in the `/Names /Dests` tree)."
-  @spec named(Document.t(), binary()) :: term()
-  def named(doc, name) do
+  @spec named(Document.t(), binary(), map() | nil) :: term()
+  def named(doc, name, ctx \\ nil)
+
+  def named(_doc, name, %{dests: dests, names: names}),
+    do: Map.get(dests, name) || Map.get(names, name)
+
+  def named(doc, name, _ctx) do
     catalog = Document.catalog(doc)
 
     from_dict =
@@ -92,11 +137,13 @@ defmodule EmbedPdf.Destinations do
     dict ++ tree
   end
 
-  defp explicit(doc, [page | rest]) do
+  defp explicit(doc, [page | rest], ctx) do
     page_index =
-      case page do
-        {:ref, _, _} = ref -> Document.page_index(doc, ref)
-        n when is_integer(n) -> if n >= 0 and n < Document.page_count(doc), do: n, else: nil
+      case {page, ctx} do
+        {{:ref, n, _}, %{pages: pages}} -> Map.get(pages, n)
+        {{:ref, _, _} = ref, _} -> Document.page_index(doc, ref)
+        {n, %{page_count: count}} when is_integer(n) -> if n >= 0 and n < count, do: n, else: nil
+        {n, _} when is_integer(n) -> if n >= 0 and n < Document.page_count(doc), do: n, else: nil
         _ -> nil
       end
 
@@ -136,7 +183,7 @@ defmodule EmbedPdf.Destinations do
     end
   end
 
-  defp explicit(_doc, _), do: nil
+  defp explicit(_doc, _, _ctx), do: nil
 
   @doc "Builds an explicit `/XYZ` destination array for a page."
   @spec build(Document.t(), non_neg_integer(), keyword()) :: list()
@@ -158,13 +205,13 @@ defmodule EmbedPdf.Destinations do
   `{:goto, dest}` | `{:uri, url}` | `{:named, name}` | `{:external, %{file:, dest:}}`
   | `{:launch, file}` | `{:javascript, code}` | `{:other, type}` | nil.
   """
-  @spec action(Document.t(), term()) :: tuple() | nil
-  def action(doc, value) do
+  @spec action(Document.t(), term(), map() | nil) :: tuple() | nil
+  def action(doc, value, ctx \\ nil) do
     case Document.resolve(doc, value) do
       %{} = a ->
         case Document.resolve(doc, a["S"]) do
           "GoTo" ->
-            case resolve(doc, a["D"]) do
+            case resolve(doc, a["D"], ctx) do
               nil -> nil
               dest -> {:goto, dest}
             end
@@ -176,7 +223,11 @@ defmodule EmbedPdf.Destinations do
             end
 
           "Named" ->
-            {:named, Document.resolve(doc, a["N"])}
+            # a name; anything else in a hostile file is no action at all
+            case Document.resolve(doc, a["N"]) do
+              name when is_binary(name) -> {:named, name}
+              _ -> nil
+            end
 
           "GoToR" ->
             {:external, %{file: file_name(doc, a["F"]), dest: raw_dest(doc, a["D"])}}
@@ -236,17 +287,17 @@ defmodule EmbedPdf.Destinations do
   end
 
   @doc "The action (or `/Dest`) of an annotation or outline item dictionary."
-  @spec of_item(Document.t(), map()) :: tuple() | nil
-  def of_item(doc, dict) do
+  @spec of_item(Document.t(), map(), map() | nil) :: tuple() | nil
+  def of_item(doc, dict, ctx \\ nil) do
     cond do
       Map.has_key?(dict, "Dest") ->
-        case resolve(doc, dict["Dest"]) do
+        case resolve(doc, dict["Dest"], ctx) do
           nil -> nil
           dest -> {:goto, dest}
         end
 
       Map.has_key?(dict, "A") ->
-        action(doc, dict["A"])
+        action(doc, dict["A"], ctx)
 
       true ->
         nil

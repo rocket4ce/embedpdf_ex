@@ -6,7 +6,7 @@ defmodule EmbedPdf do
   without native code; `EmbedPdf.Live.Viewer` puts a complete viewer in a
   LiveView without any JavaScript of your own.
 
-      {:ok, doc} = EmbedPdf.open("manual.pdf")
+      {:ok, doc} = EmbedPdf.open_file("manual.pdf")
       EmbedPdf.page_count(doc)
       EmbedPdf.search(doc, "warranty")
       svg = EmbedPdf.render_svg(doc, 0)
@@ -18,23 +18,35 @@ defmodule EmbedPdf do
   @type doc :: Document.t()
 
   @doc """
-  Opens a PDF from bytes or a file path. Options: `:password`.
+  Opens a PDF from its bytes. Options: `:password`.
+
+  The argument is always taken as file content, never as a path, so bytes
+  that come from a user (an upload, a request body) cannot make the server
+  read one of its own files. Use `open_file/2` for a path you chose.
+
+  Returns `{:error, :too_complex}` for a file that needs more memory or
+  time than `EmbedPdf.Limits` allows.
   """
-  @spec open(binary() | Path.t(), keyword()) :: {:ok, doc()} | {:error, term()}
-  def open(source, opts \\ []) do
-    bytes =
-      cond do
-        is_binary(source) and String.starts_with?(source, "%PDF") ->
-          source
+  @spec open(binary(), keyword()) :: {:ok, doc()} | {:error, term()}
+  def open(bytes, opts \\ [])
 
-        is_binary(source) and byte_size(source) < 4096 and File.regular?(source) ->
-          File.read!(source)
+  def open(bytes, opts) when is_binary(bytes) do
+    # parsing happens within EmbedPdf.Limits: a hostile file fails, it does
+    # not take the caller's memory or time with it
+    case EmbedPdf.Limits.run(fn -> Document.open(bytes, opts) end) do
+      {:ok, result} -> result
+      {:error, :timeout} -> {:error, :too_complex}
+      {:error, :memory} -> {:error, :too_complex}
+      {:error, {:crash, reason}} -> {:error, {:malformed, inspect(reason, limit: 5)}}
+    end
+  end
 
-        true ->
-          source
-      end
+  def open(_, _opts), do: {:error, :not_a_pdf}
 
-    Document.open(bytes, opts)
+  @doc "Opens the PDF file at `path`. Options: `:password`."
+  @spec open_file(Path.t(), keyword()) :: {:ok, doc()} | {:error, term()}
+  def open_file(path, opts \\ []) do
+    with {:ok, bytes} <- File.read(path), do: open(bytes, opts)
   end
 
   @doc "Writes the document to PDF bytes."

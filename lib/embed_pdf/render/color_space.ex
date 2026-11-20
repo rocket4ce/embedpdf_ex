@@ -17,6 +17,9 @@ defmodule EmbedPdf.Render.ColorSpace do
 
   @type t :: term()
 
+  # the most a DeviceN space may have
+  @max_colorants 32
+
   @doc "Parses a color space value (a name, an array, or a resource name)."
   @spec parse(Document.t(), term(), map() | nil) :: t()
   def parse(doc, value, resources \\ nil),
@@ -113,7 +116,7 @@ defmodule EmbedPdf.Render.ColorSpace do
 
       "DeviceN" ->
         [names, alt, func | _] = rest ++ [nil, nil, nil]
-        n = if is_list(names), do: length(names), else: 1
+        n = if is_list(names), do: names |> length() |> min(@max_colorants), else: 1
         {:separation, n, do_parse(doc, alt, resources, depth + 1), PdfFunction.parse(doc, func)}
 
       "Pattern" ->
@@ -143,6 +146,16 @@ defmodule EmbedPdf.Render.ColorSpace do
   def components({:separation, n, _, _}), do: n
   def components({:none, n}), do: n
   def components({:pattern, _}), do: 1
+
+  @doc """
+  An upper bound on the work `to_rgb/2` takes in this space, in the steps
+  of `EmbedPdf.Render.Function.cost/1`.
+  """
+  @spec cost(t()) :: pos_integer()
+  def cost({:separation, _n, alt, func}), do: PdfFunction.cost(func) + cost(alt)
+  def cost({:indexed, base, _, _}), do: 16 + cost(base)
+  def cost({:pattern, under}) when under != nil, do: cost(under)
+  def cost(_), do: 16
 
   @doc "The initial color of a space (8.6.5)."
   @spec initial(t()) :: [number()]

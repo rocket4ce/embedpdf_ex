@@ -13,6 +13,7 @@ defmodule EmbedPdf.Outline do
   alias EmbedPdf.PDF.Document
 
   @max_depth 64
+  @max_siblings 100_000
 
   # ---------------------------------------------------------------- reading
 
@@ -20,28 +21,34 @@ defmodule EmbedPdf.Outline do
   @spec tree(Document.t()) :: [map()]
   def tree(doc) do
     case Document.get(doc, Document.catalog(doc), "Outlines") do
-      %{} = root -> doc |> read(root["First"], MapSet.new(), 0) |> elem(0)
-      _ -> []
+      %{"First" => {:ref, _, _} = first} ->
+        # the named destinations are looked up once for all the items
+        ctx = Destinations.context(doc)
+        doc |> read(first, MapSet.new(), 0, ctx) |> elem(0)
+
+      _ ->
+        []
     end
   end
 
-  defp read(_doc, nil, seen, _depth), do: {[], seen}
-  defp read(_doc, _ref, seen, depth) when depth > @max_depth, do: {[], seen}
+  defp read(_doc, nil, seen, _depth, _ctx), do: {[], seen}
+  defp read(_doc, _ref, seen, depth, _ctx) when depth > @max_depth, do: {[], seen}
 
-  defp read(doc, first, seen, depth) do
-    read_siblings(doc, first, seen, depth, [])
+  defp read(doc, first, seen, depth, ctx) do
+    read_siblings(doc, first, seen, depth, ctx, [], 0)
   end
 
-  defp read_siblings(doc, {:ref, n, _} = ref, seen, depth, acc) do
-    if MapSet.member?(seen, n) or length(acc) > 100_000 do
+  defp read_siblings(doc, {:ref, n, _} = ref, seen, depth, ctx, acc, count) do
+    if MapSet.member?(seen, n) or count > @max_siblings do
       {Enum.reverse(acc), seen}
     else
       seen = MapSet.put(seen, n)
 
       case Document.resolve(doc, ref) do
         %{} = dict ->
-          {children, seen} = read(doc, dict["First"], seen, depth + 1)
-          read_siblings(doc, dict["Next"], seen, depth, [item(doc, n, dict, children) | acc])
+          {children, seen} = read(doc, dict["First"], seen, depth + 1, ctx)
+          item = item(doc, n, dict, children, ctx)
+          read_siblings(doc, dict["Next"], seen, depth, ctx, [item | acc], count + 1)
 
         _ ->
           {Enum.reverse(acc), seen}
@@ -49,10 +56,10 @@ defmodule EmbedPdf.Outline do
     end
   end
 
-  defp read_siblings(_doc, _, seen, _depth, acc), do: {Enum.reverse(acc), seen}
+  defp read_siblings(_doc, _, seen, _depth, _ctx, acc, _count), do: {Enum.reverse(acc), seen}
 
-  defp item(doc, id, dict, children) do
-    action = Destinations.of_item(doc, dict)
+  defp item(doc, id, dict, children, ctx) do
+    action = Destinations.of_item(doc, dict, ctx)
     flags = Document.resolve(doc, dict["F"]) || 0
     count = Document.resolve(doc, dict["Count"]) || 0
 
@@ -156,6 +163,8 @@ defmodule EmbedPdf.Outline do
   @doc "Deletes items whose destination is on one of the given pages (keeping items with children)."
   def drop_destinations(doc, page_refs) do
     refs = MapSet.new(page_refs, fn {:ref, n, _} -> n end)
+    # deleting items leaves the named destinations as they are
+    ctx = Destinations.context(doc)
 
     doc
     |> tree()
@@ -163,7 +172,7 @@ defmodule EmbedPdf.Outline do
     |> Enum.reduce(doc, fn item, d ->
       raw = Document.resolve(d, {:ref, item.id, 0}) || %{}
 
-      if points_to?(d, raw, refs) do
+      if points_to?(d, raw, refs, ctx) do
         if item.children == [],
           do: delete(d, item.id),
           else: Document.put_object(d, {:ref, item.id, 0}, Map.drop(raw, ["Dest", "A"]))
@@ -173,7 +182,7 @@ defmodule EmbedPdf.Outline do
     end)
   end
 
-  defp points_to?(doc, dict, refs) do
+  defp points_to?(doc, dict, refs, ctx) do
     dest =
       cond do
         Map.has_key?(dict, "Dest") ->
@@ -188,8 +197,8 @@ defmodule EmbedPdf.Outline do
 
     dest =
       case Document.resolve(doc, dest) do
-        name when is_binary(name) -> Destinations.named(doc, name)
-        {:string, s} -> Destinations.named(doc, s)
+        name when is_binary(name) -> Destinations.named(doc, name, ctx)
+        {:string, s} -> Destinations.named(doc, s, ctx)
         other -> other
       end
 

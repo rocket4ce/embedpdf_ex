@@ -7,32 +7,48 @@ defmodule EmbedPdf.PDF.Content do
 
   alias EmbedPdf.PDF.Parser
 
-  @doc "Parses decoded content stream bytes into operations."
-  @spec parse(binary()) :: [{String.t(), list()}]
-  def parse(data) when is_binary(data), do: loop(data, [], [])
+  @doc """
+  Parses decoded content stream bytes into operations.
 
-  defp loop(input, operands, ops) do
+  With `max_ops: n` parsing stops after `n` operations: the list is built
+  whole, several times the size of the stream, so a caller that will only
+  run so many operations should not have the rest parsed.
+  """
+  @spec parse(binary(), keyword()) :: [{String.t(), list()}]
+  def parse(data, opts \\ []) when is_binary(data) do
+    case Keyword.get(opts, :max_ops, :infinity) do
+      max when is_integer(max) and max >= 0 -> loop(data, [], [], max)
+      _ -> loop(data, [], [], :infinity)
+    end
+  end
+
+  defp loop(_input, _operands, ops, 0), do: Enum.reverse(ops)
+
+  defp loop(input, operands, ops, left) do
     case Parser.parse_value(input, refs: false) do
       :eof ->
         Enum.reverse(ops)
 
       {{:keyword, "BI"}, rest} ->
         {image, rest} = inline_image(rest)
-        loop(rest, [], [{"BI", [image]} | ops])
+        loop(rest, [], [{"BI", [image]} | ops], spend(left))
 
       {{:keyword, ""}, rest} ->
-        loop(rest, operands, ops)
+        loop(rest, operands, ops, left)
 
       {{:keyword, op}, rest} when op in ["]", ")", ">", "}", "{"] ->
-        loop(rest, operands, ops)
+        loop(rest, operands, ops, left)
 
       {{:keyword, op}, rest} ->
-        loop(rest, [], [{op, Enum.reverse(operands)} | ops])
+        loop(rest, [], [{op, Enum.reverse(operands)} | ops], spend(left))
 
       {value, rest} ->
-        loop(rest, [value | operands], ops)
+        loop(rest, [value | operands], ops, left)
     end
   end
+
+  defp spend(:infinity), do: :infinity
+  defp spend(left), do: left - 1
 
   @abbrev %{
     "BPC" => "BitsPerComponent",
@@ -137,7 +153,8 @@ defmodule EmbedPdf.PDF.Content do
           {comps, dict["BitsPerComponent"] || 8}
         end
 
-      div(w * comps * bpc + 7, 8) * h
+      # anything but a bit depth leaves the length unknown
+      if is_integer(bpc), do: div(w * comps * bpc + 7, 8) * h
     else
       _ -> nil
     end

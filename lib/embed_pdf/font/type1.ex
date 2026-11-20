@@ -20,6 +20,13 @@ defmodule EmbedPdf.Font.Type1 do
 
   @type t :: %__MODULE__{}
 
+  # bytes of clear text read after a `/FontMatrix` key
+  @matrix_slice 512
+  # longest token read as an integer (counts, lengths, indices)
+  @max_int_digits 12
+  # a charstring opens with `hsbw`/`sbw` after at most a few operands
+  @width_prefix 512
+
   @doc "Whether the bytes look like a Type 1 program (PFA or PFB)."
   def type1?(<<0x80, 1, _::binary>>), do: true
   def type1?(<<"%!PS-AdobeFont", _::binary>>), do: true
@@ -40,7 +47,7 @@ defmodule EmbedPdf.Font.Type1 do
         private = decrypt(encrypted, 55665) |> drop(4)
 
         len_iv =
-          case Regex.run(~r{/lenIV\s+(-?\d+)}, private) do
+          case Regex.run(~r|/lenIV\s+(-?\d{1,6})|, private) do
             [_, n] -> String.to_integer(n)
             _ -> 4
           end
@@ -101,14 +108,15 @@ defmodule EmbedPdf.Font.Type1 do
 
   @doc "Type 1 decryption (`r` = 55665 for eexec, 4330 for charstrings)."
   @spec decrypt(binary(), non_neg_integer()) :: binary()
-  def decrypt(data, r), do: do_decrypt(data, r, [])
+  def decrypt(data, r), do: do_decrypt(data, r, <<>>)
 
+  # (appends to a binary: a list of bytes takes sixteen times the font's size)
   defp do_decrypt(<<c, rest::binary>>, r, acc) do
     p = bxor(c, r >>> 8)
-    do_decrypt(rest, band((c + r) * 52845 + 22719, 0xFFFF), [p | acc])
+    do_decrypt(rest, band((c + r) * 52845 + 22719, 0xFFFF), <<acc::binary, p>>)
   end
 
-  defp do_decrypt(<<>>, _r, acc), do: acc |> Enum.reverse() |> :erlang.list_to_binary()
+  defp do_decrypt(<<>>, _r, acc), do: acc
 
   defp drop(bin, n) when n >= 0 and byte_size(bin) >= n,
     do: binary_part(bin, n, byte_size(bin) - n)
@@ -118,20 +126,36 @@ defmodule EmbedPdf.Font.Type1 do
 
   # ---------------------------------------------------------------- cleartext
 
-  defp font_matrix(clear) do
-    case Regex.run(~r{/FontMatrix\s*[\[\{]([^\]\}]*)[\]\}]}, clear) do
-      [_, nums] ->
-        values =
-          nums
-          |> String.split(~r/\s+/, trim: true)
-          |> Enum.map(&parse_num/1)
+  @default_matrix [0.001, 0.0, 0.0, 0.001, 0.0, 0.0]
 
-        if length(values) == 6 and Enum.all?(values, &is_number/1) and Enum.at(values, 0) != 0,
-          do: Enum.map(values, &(&1 / 1)),
-          else: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0]
+  # The first `/FontMatrix [a b c d e f]` (or `{…}`). Each occurrence of the
+  # key is tried on a short slice: one regex over the whole text goes
+  # quadratic on a text made of `/FontMatrix[` alone.
+  defp font_matrix(clear), do: font_matrix(clear, 0)
 
-      _ ->
-        [0.001, 0.0, 0.0, 0.001, 0.0, 0.0]
+  defp font_matrix(clear, from) do
+    case :binary.match(clear, "/FontMatrix", scope: {from, byte_size(clear) - from}) do
+      {pos, len} ->
+        slice = binary_part(clear, pos, min(@matrix_slice, byte_size(clear) - pos))
+
+        case Regex.run(~r{\A/FontMatrix\s*[\[\{]([^\]\}]*)[\]\}]}, slice) do
+          [_, nums] ->
+            values =
+              nums
+              |> String.split(~r/\s+/, trim: true)
+              |> Enum.map(&parse_num/1)
+
+            if length(values) == 6 and Enum.all?(values, &is_number/1) and
+                 Enum.at(values, 0) != 0,
+               do: Enum.map(values, &(&1 / 1)),
+               else: @default_matrix
+
+          _ ->
+            font_matrix(clear, pos + len)
+        end
+
+      :nomatch ->
+        @default_matrix
     end
   end
 
@@ -148,7 +172,7 @@ defmodule EmbedPdf.Font.Type1 do
         Encoding.named("StandardEncoding")
 
       true ->
-        case Regex.scan(~r{dup\s+(\d+)\s*/([^\s/\[\]\(\)\{\}<>]+)\s+put}, clear) do
+        case Regex.scan(~r|dup\s+(\d{1,9})\s*/([^\s/\[\]\(\)\{\}<>]{1,255})\s+put|, clear) do
           [] ->
             nil
 
@@ -278,7 +302,7 @@ defmodule EmbedPdf.Font.Type1 do
   defp next_int(input) do
     {tok, rest} = next_token(input)
 
-    case Integer.parse(tok) do
+    case byte_size(tok) <= @max_int_digits && Integer.parse(tok) do
       {n, ""} -> {n, rest}
       _ -> :error
     end
@@ -336,7 +360,9 @@ defmodule EmbedPdf.Font.Type1 do
   @spec advance(t(), String.t()) :: float() | nil
   def advance(%__MODULE__{} = t1, name) when is_binary(name) do
     with {:ok, encrypted} <- Map.fetch(t1.charstrings, name),
-         wx when is_number(wx) <- side_bearing_width(decrypt_charstring(encrypted, t1.len_iv), []) do
+         # the cipher is a stream: the opening bytes decrypt on their own
+         prefix = binary_part(encrypted, 0, min(byte_size(encrypted), @width_prefix)),
+         wx when is_number(wx) <- side_bearing_width(decrypt_charstring(prefix, t1.len_iv), []) do
       [a | _] = t1.matrix
       wx * a
     else
@@ -374,7 +400,10 @@ end
 defmodule EmbedPdf.Font.Type1.Charstring do
   @moduledoc "Type 1 charstring interpreter: outlines in charstring units, hints ignored."
 
+  # operators and operands both count (see the Type 2 interpreter)
   @max_ops 100_000
+  # 24 in the Type 1 specification
+  @max_stack 256
 
   @doc """
   Runs a decrypted charstring. `ctx` has `:subrs` (tuple of decrypted
@@ -411,6 +440,7 @@ defmodule EmbedPdf.Font.Type1.Charstring do
 
   defp exec(_cs, %{ops: n} = st, _ctx, _d) when n > @max_ops, do: {:error, st}
   defp exec(_cs, st, _ctx, d) when d > 12, do: {:error, st}
+  defp exec(_cs, %{stack: stack} = st, _ctx, _d) when length(stack) > @max_stack, do: {:error, st}
   defp exec(<<>>, st, _ctx, _d), do: {:eof, st}
 
   defp exec(<<255, v::signed-32, rest::binary>>, st, ctx, d), do: exec(rest, push(st, v), ctx, d)
@@ -602,7 +632,7 @@ defmodule EmbedPdf.Font.Type1.Charstring do
 
   # ---------------------------------------------------------------- helpers
 
-  defp push(st, v), do: %{st | stack: [v | st.stack]}
+  defp push(st, v), do: %{st | stack: [v | st.stack], ops: st.ops + 1}
   defp args(st), do: Enum.reverse(st.stack)
   defp clear(st), do: %{st | stack: [], ops: st.ops + 1}
 

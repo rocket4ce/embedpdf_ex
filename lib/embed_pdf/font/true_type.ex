@@ -194,43 +194,84 @@ defmodule EmbedPdf.Font.TrueType do
 
   # ---------------------------------------------------------------- cmap
 
+  # Subtables are expanded into `%{code => gid}` maps, so a few bytes of a
+  # hostile font could ask for millions of entries (wide format 12/13 groups,
+  # overlapping format 4 segments, many encoding records sharing one
+  # subtable). The whole table gets a budget of @max_cmap_entries code
+  # points, far above what a font with 65,535 glyphs and the usual four
+  # Unicode records needs; what does not fit is left unmapped.
+  @max_cmap_records 64
+  @max_cmap_entries 524_288
+  # format 12/13 groups of one subtable
+  @max_subtable_entries 262_144
+
   defp parse_cmaps(<<_version::16, n::16, rest::binary>> = cmap) do
+    n = min(n, @max_cmap_records)
+
     records =
       for <<p::16, e::16, off::32 <- binary_part(rest, 0, min(n * 8, byte_size(rest)))>>,
         do: {p, e, off}
 
-    Enum.reduce(records, %{}, fn {p, e, off}, acc ->
-      if Map.has_key?(acc, {p, e}) or off >= byte_size(cmap) do
-        acc
-      else
-        sub = binary_part(cmap, off, byte_size(cmap) - off)
+    {cmaps, _parsed, _budget} =
+      Enum.reduce(records, {%{}, %{}, @max_cmap_entries}, fn {p, e, off}, {acc, parsed, budget} ->
+        if Map.has_key?(acc, {p, e}) or off >= byte_size(cmap) do
+          {acc, parsed, budget}
+        else
+          # records often share a subtable: it is parsed once, but each
+          # record that keeps it pays for its entries
+          {map, parsed, budget} =
+            case parsed do
+              %{^off => map} when is_map(map) and map_size(map) <= budget ->
+                {map, parsed, budget - map_size(map)}
 
-        case safe_subtable(sub) do
-          map when is_map(map) and map_size(map) > 0 -> Map.put(acc, {p, e}, map)
-          _ -> acc
+              %{^off => _} ->
+                {nil, parsed, budget}
+
+              _ ->
+                sub = binary_part(cmap, off, byte_size(cmap) - off)
+                {map, left} = safe_subtable(sub, budget)
+                {map, Map.put(parsed, off, map), left}
+            end
+
+          case map do
+            map when is_map(map) and map_size(map) > 0 ->
+              {Map.put(acc, {p, e}, map), parsed, budget}
+
+            _ ->
+              {acc, parsed, budget}
+          end
         end
-      end
-    end)
+      end)
+
+    cmaps
   rescue
     _ -> %{}
   end
 
   defp parse_cmaps(_), do: %{}
 
-  defp safe_subtable(sub) do
-    parse_subtable(sub)
+  # {map | nil, budget left}
+  defp safe_subtable(sub, budget) do
+    parse_subtable(sub, budget)
   rescue
-    _ -> nil
+    _ -> {nil, budget}
   end
 
-  defp parse_subtable(<<0::16, _len::16, _lang::16, glyphs::binary-256, _::binary>>) do
-    for {gid, code} <- glyphs |> :binary.bin_to_list() |> Enum.with_index(),
-        gid != 0,
-        into: %{},
-        do: {code, gid}
+  defp parse_subtable(<<0::16, _len::16, _lang::16, glyphs::binary-256, _::binary>>, budget)
+       when budget >= 256 do
+    map =
+      for {gid, code} <- glyphs |> :binary.bin_to_list() |> Enum.with_index(),
+          gid != 0,
+          into: %{},
+          do: {code, gid}
+
+    {map, budget - 256}
   end
 
-  defp parse_subtable(<<4::16, _len::16, _lang::16, seg_x2::16, _::binary-6, rest::binary>>) do
+  defp parse_subtable(
+         <<4::16, _len::16, _lang::16, seg_x2::16, _::binary-6, rest::binary>>,
+         budget
+       ) do
     seg = div(seg_x2, 2)
 
     <<ends::binary-size(seg_x2), _pad::16, starts::binary-size(seg_x2),
@@ -241,60 +282,95 @@ defmodule EmbedPdf.Font.TrueType do
     deltas = for <<v::16 <- deltas>>, do: v
     offsets = for <<v::16 <- range_offsets>>, do: v
 
-    [ends, starts, deltas, offsets]
-    |> Enum.zip()
-    |> Enum.with_index()
-    |> Enum.reduce(%{}, fn {{e, s, delta, ro}, i}, acc ->
-      if s > e or s == 0xFFFF do
-        acc
-      else
-        Enum.reduce(s..min(e, 0xFFFE)//1, acc, fn c, acc ->
-          gid =
-            if ro == 0 do
-              band(c + delta, 0xFFFF)
-            else
-              idx = i + div(ro, 2) + (c - s) - seg
+    # the segments of a well-formed subtable do not overlap: 65,535 codes at most
+    allowed = min(budget, 0x10000)
 
-              if idx >= 0 and 2 * idx + 2 <= byte_size(glyph_ids) do
-                <<_::binary-size(2 * idx), g::16, _::binary>> = glyph_ids
-                if g == 0, do: 0, else: band(g + delta, 0xFFFF)
-              else
-                0
-              end
-            end
+    {map, left} =
+      [ends, starts, deltas, offsets]
+      |> Enum.zip()
+      |> Enum.with_index()
+      |> Enum.reduce_while({%{}, allowed}, fn {{e, s, delta, ro}, i}, {acc, left} ->
+        cond do
+          left <= 0 ->
+            {:halt, {acc, left}}
 
-          if gid != 0, do: Map.put(acc, c, gid), else: acc
-        end)
-      end
-    end)
+          s > e or s == 0xFFFF ->
+            {:cont, {acc, left}}
+
+          true ->
+            last = min(min(e, 0xFFFE), s + left - 1)
+
+            acc =
+              Enum.reduce(s..last//1, acc, fn c, acc ->
+                gid =
+                  if ro == 0 do
+                    band(c + delta, 0xFFFF)
+                  else
+                    idx = i + div(ro, 2) + (c - s) - seg
+
+                    if idx >= 0 and 2 * idx + 2 <= byte_size(glyph_ids) do
+                      <<_::binary-size(2 * idx), g::16, _::binary>> = glyph_ids
+                      if g == 0, do: 0, else: band(g + delta, 0xFFFF)
+                    else
+                      0
+                    end
+                  end
+
+                if gid != 0, do: Map.put(acc, c, gid), else: acc
+              end)
+
+            {:cont, {acc, left - max(last - s + 1, 0)}}
+        end
+      end)
+
+    {map, budget - (allowed - left)}
   end
 
-  defp parse_subtable(<<6::16, _len::16, _lang::16, first::16, count::16, rest::binary>>) do
+  defp parse_subtable(
+         <<6::16, _len::16, _lang::16, first::16, count::16, rest::binary>>,
+         budget
+       ) do
+    count = min(count, budget)
     gids = for <<g::16 <- binary_part(rest, 0, min(2 * count, byte_size(rest)))>>, do: g
 
-    gids
-    |> Enum.with_index(first)
-    |> Enum.reduce(%{}, fn {g, c}, acc -> if g != 0, do: Map.put(acc, c, g), else: acc end)
+    map =
+      gids
+      |> Enum.with_index(first)
+      |> Enum.reduce(%{}, fn {g, c}, acc -> if g != 0, do: Map.put(acc, c, g), else: acc end)
+
+    {map, budget - length(gids)}
   end
 
-  defp parse_subtable(<<fmt::16, _::16, _len::32, _lang::32, n::32, rest::binary>>)
+  defp parse_subtable(<<fmt::16, _::16, _len::32, _lang::32, n::32, rest::binary>>, budget)
        when fmt in [12, 13] do
     groups =
       for <<s::32, e::32, g::32 <- binary_part(rest, 0, min(12 * n, byte_size(rest)))>>,
         do: {s, e, g}
 
-    Enum.reduce(groups, %{}, fn {s, e, g}, acc ->
-      # guard against absurd ranges in broken fonts
-      e = min(e, s + 0x10000)
+    allowed = min(budget, @max_subtable_entries)
 
-      Enum.reduce(s..e//1, acc, fn c, acc ->
-        gid = if fmt == 12, do: g + (c - s), else: g
-        if gid != 0, do: Map.put(acc, c, gid), else: acc
+    {map, left} =
+      Enum.reduce_while(groups, {%{}, allowed}, fn {s, e, g}, {acc, left} ->
+        if left <= 0 do
+          {:halt, {acc, left}}
+        else
+          # guard against absurd ranges in broken fonts
+          e = e |> min(s + 0x10000) |> min(s + left - 1)
+
+          acc =
+            Enum.reduce(s..e//1, acc, fn c, acc ->
+              gid = if fmt == 12, do: g + (c - s), else: g
+              if gid != 0, do: Map.put(acc, c, gid), else: acc
+            end)
+
+          {:cont, {acc, left - max(e - s + 1, 0)}}
+        end
       end)
-    end)
+
+    {map, budget - (allowed - left)}
   end
 
-  defp parse_subtable(_), do: nil
+  defp parse_subtable(_, budget), do: {nil, budget}
 
   defp reverse_unicode(cmaps) do
     table =
@@ -397,6 +473,13 @@ defmodule EmbedPdf.Font.TrueType do
 
   # ---------------------------------------------------------------- glyf
 
+  # One glyph may reference at most @max_components components over its
+  # whole composite tree and produce at most @max_points points (a simple
+  # glyph has up to 65,535); past that it has no outline. Without this, a
+  # few hundred bytes of nested composites multiply into billions of points.
+  @max_components 256
+  @max_points 100_000
+
   @doc """
   The outline of glyph `gid` in em units (font units / unitsPerEm), or nil
   if the glyph does not exist. CFF-flavored fonts delegate to their CFF.
@@ -405,12 +488,18 @@ defmodule EmbedPdf.Font.TrueType do
   def glyph(%__MODULE__{cff: %CFF{} = cff}, gid), do: CFF.glyph(cff, gid)
 
   def glyph(%__MODULE__{} = tt, gid) do
-    case contours(tt, gid, 0) do
-      nil -> nil
-      contours -> contours |> Enum.flat_map(&contour_path/1) |> Outline.scale(1 / tt.units_per_em)
+    case contours(tt, gid, 0, {@max_components, @max_points}) do
+      {nil, _} ->
+        nil
+
+      {contours, _} ->
+        contours |> Enum.flat_map(&contour_path/1) |> Outline.scale(1 / tt.units_per_em)
     end
   rescue
     _ -> nil
+  catch
+    # over the per-glyph budget: no outline, as for a broken glyph
+    :throw, :glyph_budget -> nil
   end
 
   defp glyph_data(%__MODULE__{loca: loca, glyf: glyf, loca_format: fmt, num_glyphs: n}, gid) do
@@ -438,25 +527,37 @@ defmodule EmbedPdf.Font.TrueType do
     end
   end
 
-  # contours as lists of {x, y, on_curve?} in font units
-  defp contours(_tt, _gid, depth) when depth > 8, do: []
+  # contours as lists of {x, y, on_curve?} in font units, with the budget
+  # `{components, points}` left
+  defp contours(_tt, _gid, depth, budget) when depth > 8, do: {[], budget}
 
-  defp contours(tt, gid, depth) do
+  defp contours(tt, gid, depth, {comps, points} = budget) do
     case glyph_data(tt, gid) do
-      nil -> nil
-      <<>> -> []
-      <<n::signed-16, _bbox::binary-8, rest::binary>> when n >= 0 -> simple(rest, n)
-      <<_n::signed-16, _bbox::binary-8, rest::binary>> -> composite(tt, rest, depth, [])
-      _ -> []
+      nil ->
+        {nil, budget}
+
+      <<>> ->
+        {[], budget}
+
+      <<n::signed-16, _bbox::binary-8, rest::binary>> when n >= 0 ->
+        {contours, points} = simple(rest, n, points)
+        {contours, {comps, points}}
+
+      <<_n::signed-16, _bbox::binary-8, rest::binary>> ->
+        composite(tt, rest, depth, [], budget)
+
+      _ ->
+        {[], budget}
     end
   end
 
-  defp simple(_data, 0), do: []
+  defp simple(_data, 0, budget), do: {[], budget}
 
-  defp simple(data, n) do
+  defp simple(data, n, budget) do
     <<ends::binary-size(2 * n), ilen::16, _instr::binary-size(ilen), rest::binary>> = data
     ends = for <<e::16 <- ends>>, do: e
     count = List.last(ends) + 1
+    if count > budget, do: throw(:glyph_budget)
     {flags, rest} = read_flags(rest, count, [])
     {xs, rest} = read_coords(rest, flags, 2, 16, 0, [])
     {ys, _rest} = read_coords(rest, flags, 4, 32, 0, [])
@@ -464,8 +565,9 @@ defmodule EmbedPdf.Font.TrueType do
     points =
       Enum.zip([xs, ys, flags])
       |> Enum.map(fn {x, y, f} -> {x, y, band(f, 1) == 1} end)
+      |> List.to_tuple()
 
-    split_contours(points, ends, 0, [])
+    split_contours(points, ends, 0, [], budget)
   end
 
   defp read_flags(rest, 0, acc), do: {Enum.reverse(acc), rest}
@@ -511,14 +613,24 @@ defmodule EmbedPdf.Font.TrueType do
     end
   end
 
-  defp split_contours(_points, [], _from, acc), do: Enum.reverse(acc)
+  # `points` is a tuple; each contour is its points `from..e`. End points
+  # that go backwards make contours overlap, so the points handed out are
+  # counted against the budget rather than the points of the glyph.
+  defp split_contours(_points, [], _from, acc, budget), do: {Enum.reverse(acc), budget}
 
-  defp split_contours(points, [e | ends], from, acc) do
-    contour = Enum.slice(points, from..e//1)
-    split_contours(points, ends, e + 1, if(contour == [], do: acc, else: [contour | acc]))
+  defp split_contours(points, [e | ends], from, acc, budget) do
+    last = min(e, tuple_size(points) - 1)
+    budget = budget - max(last - from + 1, 0)
+    if budget < 0, do: throw(:glyph_budget)
+    contour = for i <- from..last//1, do: elem(points, i)
+    acc = if contour == [], do: acc, else: [contour | acc]
+    split_contours(points, ends, e + 1, acc, budget)
   end
 
-  defp composite(tt, data, depth, acc) do
+  defp composite(_tt, _data, _depth, _acc, {comps, _points}) when comps <= 0,
+    do: throw(:glyph_budget)
+
+  defp composite(tt, data, depth, acc, {comps, points}) do
     case data do
       <<flags::16, gid::16, rest::binary>> ->
         xy? = band(flags, 2) != 0
@@ -563,8 +675,10 @@ defmodule EmbedPdf.Font.TrueType do
         {dx, dy} = if xy?, do: {a1, a2}, else: {0, 0}
         {xx, xy, yx, yy} = m
 
+        {part, budget} = contours(tt, gid, depth + 1, {comps - 1, points})
+
         component =
-          (contours(tt, gid, depth + 1) || [])
+          (part || [])
           |> Enum.map(fn contour ->
             Enum.map(contour, fn {x, y, on} ->
               {xx * x + yx * y + dx, xy * x + yy * y + dy, on}
@@ -572,10 +686,13 @@ defmodule EmbedPdf.Font.TrueType do
           end)
 
         acc = Enum.reverse(component, acc)
-        if band(flags, 0x20) != 0, do: composite(tt, rest, depth, acc), else: Enum.reverse(acc)
+
+        if band(flags, 0x20) != 0,
+          do: composite(tt, rest, depth, acc, budget),
+          else: {Enum.reverse(acc), budget}
 
       _ ->
-        Enum.reverse(acc)
+        {Enum.reverse(acc), {comps, points}}
     end
   end
 

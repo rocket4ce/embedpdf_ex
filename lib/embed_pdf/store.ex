@@ -7,6 +7,10 @@ defmodule EmbedPdf.Store do
   every edit; page URLs carry the revision, so browsers cache them safely.
   A document is dropped some time after the last process that keeps it
   (`keep/2`) exits, which leaves room for LiveView reconnects.
+
+  Rendered pages are memoized up to a memory budget (128 MB by default):
+
+      config :embedpdf_ex, render_cache_bytes: 256_000_000
   """
 
   use GenServer
@@ -78,7 +82,9 @@ defmodule EmbedPdf.Store do
   @doc "Removes a document."
   def delete(id) do
     :ets.delete(@docs, id)
-    :ets.match_delete(@cache, {{id, :_, :_}, :_})
+    freed = @cache |> :ets.select([{{{id, :_, :_}, :_, :"$1"}, [], [:"$1"]}]) |> Enum.sum()
+    :ets.match_delete(@cache, {{id, :_, :_}, :_, :_})
+    if freed > 0, do: :ets.update_counter(@cache, :bytes, {2, -freed, 0, 0}, {:bytes, 0})
     :ok
   end
 
@@ -89,16 +95,30 @@ defmodule EmbedPdf.Store do
   @spec cached(String.t(), term(), (-> term())) :: term()
   def cached(id, key, fun) do
     case :ets.lookup(@cache, {id, key, :v}) do
-      [{_, value}] ->
+      [{_, value, _size}] ->
         value
 
       [] ->
         value = fun.()
-        if :ets.info(@cache, :size) > @cache_limit, do: :ets.delete_all_objects(@cache)
-        :ets.insert(@cache, {{id, key, :v}, value})
+        size = if is_binary(value), do: byte_size(value), else: :erlang.external_size(value)
+
+        if size <= cache_bytes() do
+          total = :ets.update_counter(@cache, :bytes, size, {:bytes, 0})
+
+          # past the budget everything goes; pages in view are rendered again on demand
+          if total > cache_bytes() or :ets.info(@cache, :size) > @cache_limit do
+            :ets.delete_all_objects(@cache)
+            :ets.insert(@cache, {:bytes, size})
+          end
+
+          :ets.insert(@cache, {{id, key, :v}, value, size})
+        end
+
         value
     end
   end
+
+  defp cache_bytes, do: Application.get_env(:embedpdf_ex, :render_cache_bytes, 128_000_000)
 
   # ---------------------------------------------------------------- server
 

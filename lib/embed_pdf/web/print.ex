@@ -5,8 +5,12 @@ defmodule EmbedPdf.Web.Print do
   """
 
   @doc false
-  def html(entry, doc_id, rev, pages, rot, base) do
-    title = Phoenix.HTML.html_escape(entry.name) |> Phoenix.HTML.safe_to_string()
+  def html(entry, doc_id, rev, pages, rot, base)
+      when is_integer(rev) and rot in [0, 90, 180, 270] do
+    esc = &(&1 |> to_string() |> Phoenix.HTML.html_escape() |> Phoenix.HTML.safe_to_string())
+    title = esc.(entry.name)
+    doc_id = esc.(doc_id)
+    base = esc.(base)
 
     imgs =
       Enum.map(pages, fn n ->

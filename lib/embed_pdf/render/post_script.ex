@@ -1,35 +1,62 @@
 defmodule EmbedPdf.Render.PostScript do
-  @moduledoc "The PostScript calculator subset used by type 4 functions (ISO 32000-1, 7.10.5)."
+  @moduledoc """
+  The PostScript calculator subset used by type 4 functions (ISO 32000-1, 7.10.5).
+
+  A program has no loops, so it runs each of its tokens once at most. One
+  of more than 16384 tokens is not run at all, and one that puts more
+  than 100 operands on the stack (the limit the format sets) fails;
+  either way the function passes its inputs through, as it does for any
+  program that cannot be run. Integers are 32 bits wide, as in PostScript:
+  a result that does not fit becomes a real.
+  """
 
   alias EmbedPdf.PDF.Parser
+
+  @max_tokens 16_384
+  @max_stack 100
+  @max_int 0x7FFFFFFF
+  @min_int -0x80000000
 
   @doc "Parses `{ ... }` program text into nested lists of numbers, operators and `{:if, a}` / `{:ifelse, a, b}`."
   @spec parse(binary()) :: list()
   def parse(code) do
-    tokens = tokenize(code, [])
-
-    case tokens do
+    case tokenize(code, [], 0) do
       [{:open} | rest] -> rest |> block([]) |> elem(0)
       _ -> []
     end
   end
 
-  defp tokenize(code, acc) do
+  @doc "The number of steps running `program` takes at most."
+  @spec steps(list()) :: non_neg_integer()
+  def steps(program) when is_list(program) do
+    Enum.reduce(program, 0, fn
+      {:if, a}, n -> n + 1 + steps(a)
+      {:ifelse, a, b}, n -> n + 1 + steps(a) + steps(b)
+      _, n -> n + 1
+    end)
+  end
+
+  def steps(_), do: 0
+
+  # too long a program is no program
+  defp tokenize(_code, _acc, count) when count > @max_tokens, do: []
+
+  defp tokenize(code, acc, count) do
     case Parser.skip_ws(code) do
       <<>> ->
         Enum.reverse(acc)
 
       <<"{", rest::binary>> ->
-        tokenize(rest, [{:open} | acc])
+        tokenize(rest, [{:open} | acc], count + 1)
 
       <<"}", rest::binary>> ->
-        tokenize(rest, [{:close} | acc])
+        tokenize(rest, [{:close} | acc], count + 1)
 
       rest ->
         case Parser.parse_value(rest, refs: false) do
-          {{:keyword, kw}, r} -> tokenize(r, [kw | acc])
-          {n, r} when is_number(n) -> tokenize(r, [n | acc])
-          {_, r} -> tokenize(r, acc)
+          {{:keyword, kw}, r} -> tokenize(r, [kw | acc], count + 1)
+          {n, r} when is_number(n) -> tokenize(r, [n | acc], count + 1)
+          {_, r} -> tokenize(r, acc, count + 1)
           :eof -> Enum.reverse(acc)
         end
     end
@@ -79,21 +106,31 @@ defmodule EmbedPdf.Render.PostScript do
 
   defp exec([], stack), do: stack
 
-  defp exec([op | rest], stack), do: exec(rest, step(op, stack))
+  defp exec([op | rest], stack) do
+    # a step adds at most as many operands as there are (`copy`)
+    case step(op, stack) do
+      stack when length(stack) > @max_stack -> raise ArgumentError, "stackoverflow"
+      stack -> exec(rest, stack)
+    end
+  end
 
-  defp step(n, s) when is_number(n), do: [n | s]
+  # keeps integers within 32 bits: beyond, PostScript goes on with a real
+  defp int(n) when is_integer(n) and (n > @max_int or n < @min_int), do: n / 1
+  defp int(n), do: n
+
+  defp step(n, s) when is_number(n), do: [int(n) | s]
   defp step({:if, a}, [c | s]), do: if(truthy(c), do: exec(a, s), else: s)
   defp step({:ifelse, a, b}, [c | s]), do: if(truthy(c), do: exec(a, s), else: exec(b, s))
   defp step("true", s), do: [true | s]
   defp step("false", s), do: [false | s]
-  defp step("add", [b, a | s]), do: [a + b | s]
-  defp step("sub", [b, a | s]), do: [a - b | s]
-  defp step("mul", [b, a | s]), do: [a * b | s]
+  defp step("add", [b, a | s]), do: [int(a + b) | s]
+  defp step("sub", [b, a | s]), do: [int(a - b) | s]
+  defp step("mul", [b, a | s]), do: [int(a * b) | s]
   defp step("div", [b, a | s]), do: [if(b == 0, do: 0.0, else: a / b) | s]
   defp step("idiv", [b, a | s]), do: [if(b == 0, do: 0, else: div(trunc(a), trunc(b))) | s]
   defp step("mod", [b, a | s]), do: [if(b == 0, do: 0, else: rem(trunc(a), trunc(b))) | s]
-  defp step("neg", [a | s]), do: [-a | s]
-  defp step("abs", [a | s]), do: [abs(a) | s]
+  defp step("neg", [a | s]), do: [int(-a) | s]
+  defp step("abs", [a | s]), do: [int(abs(a)) | s]
   defp step("ceiling", [a | s]), do: [Float.ceil(a / 1) | s]
   defp step("floor", [a | s]), do: [Float.floor(a / 1) | s]
   defp step("round", [a | s]), do: [Float.round(a / 1) | s]
@@ -151,10 +188,11 @@ defmodule EmbedPdf.Render.PostScript do
   defp step("not", [a | s]) when is_boolean(a), do: [not a | s]
   defp step("not", [a | s]), do: [Bitwise.bnot(trunc(a)) | s]
 
-  defp step("bitshift", [b, a | s]),
-    do: [
-      if(b >= 0, do: Bitwise.bsl(trunc(a), trunc(b)), else: Bitwise.bsr(trunc(a), -trunc(b))) | s
-    ]
+  # no shift moves a 32-bit integer by more than 64 places
+  defp step("bitshift", [b, a | s]) do
+    b = b |> trunc() |> max(-64) |> min(64)
+    [int(if(b >= 0, do: Bitwise.bsl(trunc(a), b), else: Bitwise.bsr(trunc(a), -b))) | s]
+  end
 
   defp step(_, s), do: s
 

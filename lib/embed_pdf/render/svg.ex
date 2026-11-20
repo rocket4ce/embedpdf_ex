@@ -65,7 +65,10 @@ defmodule EmbedPdf.Render.SVG do
     run: nil,
     glyphs: %{},
     images: %{},
-    depth: 0
+    depth: 0,
+    # the work budget the page's content, its patterns, soft masks and
+    # annotation appearances share
+    budget: nil
   ]
 
   @doc """
@@ -90,9 +93,9 @@ defmodule EmbedPdf.Render.SVG do
         rotation = normalize_rotation(Keyword.get(opts, :rotation, 0))
         view = Page.view_matrix(page, rotation)
         {w, h} = display_size(page, rotation)
-        st = new(doc, page, Keyword.get(opts, :id_prefix, "p#{index}"), w, h)
+        st = new(doc, page, id_prefix(opts, "p#{index}"), w, h)
 
-        st = Interpreter.run_page(doc, page, &handle/2, st, ctm: view)
+        st = Interpreter.run_page(doc, page, &handle/2, st, ctm: view, budget: st.budget)
         st = close_all(st)
 
         st =
@@ -162,7 +165,7 @@ defmodule EmbedPdf.Render.SVG do
       rotation = normalize_rotation(Keyword.get(opts, :rotation, 0))
       view = Page.view_matrix(page, rotation)
       {w, h} = display_size(page, rotation)
-      st = new(doc, page, Keyword.get(opts, :id_prefix, "p#{index}a#{num}"), w, h)
+      st = new(doc, page, id_prefix(opts, "p#{index}a#{num}"), w, h)
       st = draw_annotation(st, view, ref, annot, true)
 
       case st.body do
@@ -174,8 +177,10 @@ defmodule EmbedPdf.Render.SVG do
     end
   end
 
-  defp new(doc, page, prefix, w, h),
-    do: %__MODULE__{doc: doc, page: page, prefix: prefix, w: w, h: h}
+  defp new(doc, page, prefix, w, h) do
+    budget = Interpreter.new_budget()
+    %__MODULE__{doc: doc, page: page, prefix: prefix, w: w, h: h, budget: budget}
+  end
 
   defp normalize_rotation(r) when is_integer(r),
     do: r |> Integer.mod(360) |> div(90) |> Kernel.*(90)
@@ -414,7 +419,9 @@ defmodule EmbedPdf.Render.SVG do
         {content, st} =
           case group do
             %Stream{} = g when st.depth < @max_depth ->
-              sub_render(st, fn st -> Interpreter.run_form(doc, g, ctm, &handle/2, st) end)
+              sub_render(st, fn st ->
+                Interpreter.run_form(doc, g, ctm, &handle/2, st, budget: st.budget)
+              end)
 
             _ ->
               {[], st}
@@ -622,7 +629,10 @@ defmodule EmbedPdf.Render.SVG do
 
         {inner, st} =
           sub_render(st, fn st ->
-            Interpreter.run(doc, content, resources, Matrix.identity(), &handle/2, st, gs: gs)
+            Interpreter.run(doc, content, resources, Matrix.identity(), &handle/2, st,
+              gs: gs,
+              budget: st.budget
+            )
           end)
 
         tile_transform = Matrix.multiply(Matrix.translate(x0, y0), transform)
@@ -1086,6 +1096,17 @@ defmodule EmbedPdf.Render.SVG do
     end
   end
 
+  # the prefix goes into ids and references as is, so it must be a plain name
+  defp id_prefix(opts, default) do
+    case Keyword.get(opts, :id_prefix) do
+      prefix when is_binary(prefix) ->
+        if Regex.match?(~r/\A[A-Za-z_][A-Za-z0-9_-]{0,63}\z/, prefix), do: prefix, else: default
+
+      _ ->
+        default
+    end
+  end
+
   defp draw_annotations(st, view, skip) do
     skip = MapSet.new(skip)
     st = %{st | doc: with_field_appearances(st.doc, st.page)}
@@ -1130,7 +1151,9 @@ defmodule EmbedPdf.Render.SVG do
                 a ->
                   {inner, st} =
                     sub_render(st, fn st ->
-                      Interpreter.run_form(doc, ap, Matrix.multiply(a, view), &handle/2, st)
+                      Interpreter.run_form(doc, ap, Matrix.multiply(a, view), &handle/2, st,
+                        budget: st.budget
+                      )
                     end)
 
                   emit(st, ["<g>", inner, "</g>"])

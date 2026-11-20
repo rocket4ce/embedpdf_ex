@@ -86,7 +86,7 @@ defmodule EmbedPdf.Live.UI do
             <.icon name="menu" />
           </button>
           <div :if={@menu == "document"} class="epdf-menu" phx-click-away="close_menu">
-            <label :if={@f["documents.open"]} class="epdf-menu-item" for={@uploads.pdf.ref}>
+            <label :if={@f["documents.open"]} class="epdf-menu-item" for={upload_ref(@uploads, :pdf)}>
               <.icon name="upload" /> {t(assigns, "menu.open")}
             </label>
             <a :if={@doc_id && @f["documents.download"]} class="epdf-menu-item" href={"#{@base}/d/#{@doc_id}/download"} download={@name}>
@@ -214,9 +214,9 @@ defmodule EmbedPdf.Live.UI do
       </div>
     </header>
     <form id={"#{@viewer_id}-upload"} class="epdf-hidden" phx-change="validate_upload">
-      <.live_file_input upload={@uploads.pdf} />
-      <.live_file_input upload={@uploads.insert} />
-      <.live_file_input upload={@uploads.attachment} />
+      <.live_file_input :if={@uploads[:pdf]} upload={@uploads.pdf} />
+      <.live_file_input :if={@uploads[:insert]} upload={@uploads.insert} />
+      <.live_file_input :if={@uploads[:attachment]} upload={@uploads.attachment} />
     </form>
     """
   end
@@ -228,10 +228,14 @@ defmodule EmbedPdf.Live.UI do
         <button class="epdf-doctab-name" phx-click="switch_tab" phx-value-id={tab.id} title={tab.name}><.icon name="file" class="epdf-icon-sm" /> {tab.name}</button>
         <button class="epdf-doctab-close" phx-click="close_tab" phx-value-id={tab.id} title={t(assigns, "close")} aria-label={t(assigns, "close")}><.icon name="close" class="epdf-icon-sm" /></button>
       </div>
-      <label :if={@f["documents.open"]} class="epdf-btn epdf-btn-sm" for={@uploads.pdf.ref} title={t(assigns, "menu.open")}><.icon name="plus" class="epdf-icon-sm" /></label>
+      <label :if={@f["documents.open"]} class="epdf-btn epdf-btn-sm" for={upload_ref(@uploads, :pdf)} title={t(assigns, "menu.open")}><.icon name="plus" class="epdf-icon-sm" /></label>
     </div>
     """
   end
+
+  # an upload exists only while its feature is on (EmbedPdf.Live.Access)
+  defp upload_ref(uploads, name), do: uploads[name] && uploads[name].ref
+  defp upload_entries(uploads, name), do: (uploads[name] && uploads[name].entries) || []
 
   defp modes(f) do
     [
@@ -297,7 +301,7 @@ defmodule EmbedPdf.Live.UI do
         >
           <input type="text" name="text" value={@signature_text} placeholder={t(assigns, "signature.your_name")} phx-debounce="300" />
         </form>
-        <label :if={@mode == :insert and @f["attachments.adding"]} class="epdf-btn" for={@uploads.attachment.ref} title={t(assigns, "tool.attachment")}>
+        <label :if={@mode == :insert and @f["attachments.adding"]} class="epdf-btn" for={upload_ref(@uploads, :attachment)} title={t(assigns, "tool.attachment")}>
           <.icon name="paperclip" />
         </label>
 
@@ -428,7 +432,7 @@ defmodule EmbedPdf.Live.UI do
     <button class="epdf-btn" phx-click="pages" phx-value-op="down" title={t(assigns, "pages.move_down")}><.icon name="chevron-down" /></button>
     <button class="epdf-btn" phx-click="pages" phx-value-op="duplicate" title={t(assigns, "pages.duplicate")}><.icon name="copy" /></button>
     <button class="epdf-btn" phx-click="pages" phx-value-op="blank" title={t(assigns, "pages.insert_blank")}><.icon name="file" /></button>
-    <label class="epdf-btn" for={@uploads.insert.ref} title={t(assigns, "pages.insert_file")}><.icon name="upload" /></label>
+    <label class="epdf-btn" for={upload_ref(@uploads, :insert)} title={t(assigns, "pages.insert_file")}><.icon name="upload" /></label>
     <button class="epdf-btn" phx-click="pages_extract" title={t(assigns, "pages.extract")}><.icon name="download" /></button>
     <button class="epdf-btn epdf-danger" phx-click="pages" phx-value-op="delete" title={t(assigns, "pages.delete")}><.icon name="trash" /></button>
     <button class="epdf-btn epdf-btn-text" phx-click="pages_select_all">{t(assigns, "pages.select_all")}</button>
@@ -545,14 +549,14 @@ defmodule EmbedPdf.Live.UI do
 
   defp empty(assigns) do
     ~H"""
-    <div class="epdf-empty" phx-drop-target={@uploads.pdf.ref}>
+    <div class="epdf-empty" phx-drop-target={upload_ref(@uploads, :pdf)}>
       <div class="epdf-empty-card">
         <.icon name="file" class="epdf-icon-xl" />
         <p :if={@status == :error} class="epdf-error">{t(assigns, @error || "error.open")}</p>
         <h2>{t(assigns, "open.title")}</h2>
         <p>{t(assigns, "open.drop")}</p>
-        <label :if={@f["documents.open"]} class="epdf-btn epdf-btn-text epdf-primary" for={@uploads.pdf.ref}>{t(assigns, "open.choose")}</label>
-        <div :for={entry <- @uploads.pdf.entries} class="epdf-progress"><span style={"width:#{entry.progress}%"}></span></div>
+        <label :if={@f["documents.open"]} class="epdf-btn epdf-btn-text epdf-primary" for={upload_ref(@uploads, :pdf)}>{t(assigns, "open.choose")}</label>
+        <div :for={entry <- upload_entries(@uploads, :pdf)} class="epdf-progress"><span style={"width:#{entry.progress}%"}></span></div>
       </div>
     </div>
     """
@@ -678,7 +682,7 @@ defmodule EmbedPdf.Live.UI do
         <a class="epdf-btn" href={"#{@base}/d/#{@doc_id}/attachment/#{a.id}"} download={a.name} title={t(assigns, "attachments.save")}><.icon name="download" /></a>
         <button :if={@f["attachments.adding"]} class="epdf-btn epdf-danger" phx-click="attachment_delete" phx-value-id={a.id} title={t(assigns, "attachments.delete")}><.icon name="trash" /></button>
       </div>
-      <label :if={@f["attachments.adding"]} class="epdf-btn epdf-btn-text" for={@uploads.attachment.ref}><.icon name="paperclip" /> {t(assigns, "attachments.add")}</label>
+      <label :if={@f["attachments.adding"]} class="epdf-btn epdf-btn-text" for={upload_ref(@uploads, :attachment)}><.icon name="paperclip" /> {t(assigns, "attachments.add")}</label>
     </div>
     """
   end
@@ -837,16 +841,28 @@ defmodule EmbedPdf.Live.UI do
   end
 
   defp signature_banner(assigns) do
-    valid = Enum.count(assigns.signatures, &(&1.status == :valid))
-    assigns = assign(assigns, valid: valid, total: length(assigns.signatures))
+    statuses = Enum.map(assigns.signatures, &Map.get(&1, :status))
+    problems = Enum.count(statuses, &(&1 not in [:valid, :modified]))
+
+    # green only when every signature is valid and nothing was changed afterwards
+    state =
+      cond do
+        problems > 0 -> :invalid
+        :modified in statuses -> :modified
+        true -> :valid
+      end
+
+    assigns = assign(assigns, state: state, problems: problems, total: length(statuses))
 
     ~H"""
-    <div class={["epdf-sigbar", @valid == @total && "is-valid", @valid < @total && "is-invalid"]} role="status">
+    <div class={["epdf-sigbar", "is-#{@state}"]} role="status">
       <.icon name="signature" />
       <span>
-        {if @valid == @total,
-          do: t(assigns, "signature.banner_valid", %{count: @total}),
-          else: t(assigns, "signature.banner_problem", %{count: @total - @valid})}
+        {case @state do
+          :valid -> t(assigns, "signature.banner_valid", %{count: @total})
+          :modified -> t(assigns, "signature.banner_modified")
+          :invalid -> t(assigns, "signature.banner_problem", %{count: @problems})
+        end}
       </span>
       <button class="epdf-btn epdf-btn-text" phx-click="panel" phx-value-side="right" phx-value-panel="signatures">{t(assigns, "signature.details")}</button>
     </div>
@@ -878,9 +894,21 @@ defmodule EmbedPdf.Live.UI do
         <dt :if={sig.location}>{t(assigns, "signature.location")}</dt>
         <dd :if={sig.location}>{sig.location}</dd>
         <dt>{t(assigns, "signature.integrity")}</dt>
-        <dd>{if sig.digest_ok? and sig.signature_ok?, do: t(assigns, "signature.intact"), else: t(assigns, "signature.broken")}</dd>
+        <dd>
+          {cond do
+            not (sig.digest_ok? and sig.signature_ok?) -> t(assigns, "signature.broken")
+            sig.covers_whole_document? -> t(assigns, "signature.intact")
+            true -> t(assigns, "signature.intact_version")
+          end}
+        </dd>
         <dt>{t(assigns, "signature.coverage")}</dt>
-        <dd>{if sig.covers_whole_document?, do: t(assigns, "signature.whole"), else: t(assigns, "signature.partial")}</dd>
+        <dd>
+          {cond do
+            sig.covers_whole_document? -> t(assigns, "signature.whole")
+            Map.get(sig, :changed_after) == :signed -> t(assigns, "signature.partial_signed")
+            true -> t(assigns, "signature.partial")
+          end}
+        </dd>
         <dt :if={sig.certificate}>{t(assigns, "signature.issuer")}</dt>
         <dd :if={sig.certificate}>{sig.certificate.issuer}{if sig.certificate.self_signed?, do: " · " <> t(assigns, "signature.self_signed")}</dd>
       </dl>
@@ -979,9 +1007,9 @@ defmodule EmbedPdf.Live.UI do
             </form>
           <% @dialog == :open -> %>
             <h3>{t(assigns, "open.title")}</h3>
-            <div class="epdf-drop" phx-drop-target={@uploads.pdf.ref}>
+            <div class="epdf-drop" phx-drop-target={upload_ref(@uploads, :pdf)}>
               <p>{t(assigns, "open.drop")}</p>
-              <label class="epdf-btn epdf-btn-text epdf-primary" for={@uploads.pdf.ref}>{t(assigns, "open.choose")}</label>
+              <label class="epdf-btn epdf-btn-text epdf-primary" for={upload_ref(@uploads, :pdf)}>{t(assigns, "open.choose")}</label>
             </div>
           <% match?({:download, _}, @dialog) -> %>
             <h3>{t(assigns, "pages.extract")}</h3>

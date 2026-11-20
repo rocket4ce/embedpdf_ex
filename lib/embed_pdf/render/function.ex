@@ -3,55 +3,154 @@ defmodule EmbedPdf.Render.Function do
   PDF functions (ISO 32000-1, 7.10): type 0 (sampled), 2 (exponential),
   3 (stitching) and 4 (PostScript calculator). Arrays of functions are
   evaluated one output each.
+
+  A function may nest others (arrays, stitching) 8 levels deep and hold
+  1024 functions in all, counting one used twice as two; whatever goes
+  beyond, or refers back to a function it is part of, is left out and
+  passes its input through.
   """
 
   alias EmbedPdf.PDF.{Document, Stream}
+  alias EmbedPdf.Render.PostScript
+
+  @max_depth 8
+  @max_functions 1024
+  # numbers kept from a range or a color: two per output, and a DeviceN
+  # space, the largest, has 32
+  @max_values 64
 
   @doc "Parses a function object (or array of them) into an evaluable term."
   @spec parse(Document.t(), term()) :: term()
   def parse(doc, value) do
-    case Document.resolve(doc, value) do
-      list when is_list(list) -> {:array, Enum.map(list, &parse(doc, &1))}
-      %Stream{dict: dict} = s -> parse_dict(doc, dict, s)
-      %{} = dict -> parse_dict(doc, dict, nil)
-      "Identity" -> :identity
-      _ -> nil
-    end
+    {func, _acc} = parse(doc, value, 0, MapSet.new(), {@max_functions, %{}})
+    func
   end
 
-  defp parse_dict(doc, dict, stream) do
-    domain = Document.resolve(doc, dict["Domain"]) || [0, 1]
-    range = Document.resolve(doc, dict["Range"])
+  # `seen`: the objects this function is nested in. `acc` is `{left, leaves}`:
+  # the functions that may still be added (whatever stands where a function
+  # should counts as one), and the sampled and calculator functions read so
+  # far by object number (their streams are decoded once).
+  # Returns {function, acc}.
+  defp parse(_doc, _value, _depth, _seen, {left, _} = acc) when left <= 0, do: {nil, acc}
 
-    case Document.resolve(doc, dict["FunctionType"]) do
-      2 ->
-        c0 = Document.resolve(doc, dict["C0"]) || [0.0]
-        c1 = Document.resolve(doc, dict["C1"]) || [1.0]
-        n = Document.resolve(doc, dict["N"]) || 1
-        {:exp, domain, range, c0, c1, n}
+  defp parse(_doc, _value, depth, _seen, {left, leaves}) when depth > @max_depth,
+    do: {nil, {left - 1, leaves}}
 
-      3 ->
-        funcs = (Document.resolve(doc, dict["Functions"]) || []) |> Enum.map(&parse(doc, &1))
-        bounds = Document.resolve(doc, dict["Bounds"]) || []
-        encode = Document.resolve(doc, dict["Encode"]) || []
-        {:stitch, domain, range, funcs, bounds, encode}
+  defp parse(doc, {:ref, n, _} = ref, depth, seen, {left, leaves}) do
+    acc = {left - 1, leaves}
 
-      0 when stream != nil ->
-        size = Document.resolve(doc, dict["Size"]) || [2]
-        bps = Document.resolve(doc, dict["BitsPerSample"]) || 8
-        encode = Document.resolve(doc, dict["Encode"]) || Enum.flat_map(size, &[0, &1 - 1])
-        decode = Document.resolve(doc, dict["Decode"]) || range
-        data = Document.stream_data(doc, stream) || <<>>
-        {:sampled, domain, range, size, bps, encode, decode, data}
+    if MapSet.member?(seen, n),
+      do: {nil, acc},
+      else: parse_value(doc, Document.resolve(doc, ref), n, depth, MapSet.put(seen, n), acc)
+  end
 
-      4 when stream != nil ->
-        code = Document.stream_data(doc, stream) || ""
-        {:postscript, domain, range, EmbedPdf.Render.PostScript.parse(code)}
+  defp parse(doc, value, depth, seen, {left, leaves}),
+    do: parse_value(doc, value, nil, depth, seen, {left - 1, leaves})
+
+  defp parse_value(doc, value, id, depth, seen, acc) do
+    case value do
+      list when is_list(list) ->
+        {funcs, acc} = parse_list(doc, list, depth + 1, seen, acc)
+        {{:array, funcs}, acc}
+
+      %Stream{dict: dict} = s ->
+        parse_dict(doc, dict, s, id, depth, seen, acc)
+
+      %{} = dict ->
+        parse_dict(doc, dict, nil, id, depth, seen, acc)
+
+      "Identity" ->
+        {:identity, acc}
 
       _ ->
-        nil
+        {nil, acc}
     end
   end
+
+  # stops at the first function that no longer fits
+  defp parse_list(doc, list, depth, seen, acc) do
+    {funcs, acc} =
+      Enum.reduce_while(list, {[], acc}, fn
+        _item, {_funcs, {left, _}} = result when left <= 0 ->
+          {:halt, result}
+
+        item, {funcs, acc} ->
+          {func, acc} = parse(doc, item, depth, seen, acc)
+          {:cont, {[func | funcs], acc}}
+      end)
+
+    {Enum.reverse(funcs), acc}
+  end
+
+  defp parse_dict(doc, dict, stream, id, depth, seen, {left, leaves} = acc) do
+    case Document.resolve(doc, dict["FunctionType"]) do
+      2 ->
+        {domain, range} = domain_range(doc, dict)
+        c0 = values(Document.resolve(doc, dict["C0"])) || [0.0]
+        c1 = values(Document.resolve(doc, dict["C1"])) || [1.0]
+        n = Document.resolve(doc, dict["N"]) || 1
+        {{:exp, domain, range, c0, c1, n}, acc}
+
+      3 ->
+        {domain, range} = domain_range(doc, dict)
+        list = Document.resolve(doc, dict["Functions"]) || []
+        {funcs, acc} = parse_list(doc, list, depth + 1, seen, acc)
+        # one bound between two functions: there are never more than those
+        bounds = Enum.take(Document.resolve(doc, dict["Bounds"]) || [], @max_functions)
+        encode = Document.resolve(doc, dict["Encode"]) || []
+        {{:stitch, domain, range, funcs, bounds, encode}, acc}
+
+      type when type in [0, 4] and stream != nil ->
+        case leaves do
+          %{^id => func} when id != nil ->
+            {func, acc}
+
+          _ ->
+            func = leaf(doc, type, dict, stream)
+            {func, {left, if(id, do: Map.put(leaves, id, func), else: leaves)}}
+        end
+
+      _ ->
+        {nil, acc}
+    end
+  end
+
+  defp leaf(doc, 0, dict, stream) do
+    {domain, range} = domain_range(doc, dict)
+    size = Document.resolve(doc, dict["Size"]) || [2]
+    bps = Document.resolve(doc, dict["BitsPerSample"]) || 8
+    encode = Document.resolve(doc, dict["Encode"]) || Enum.flat_map(size, &[0, &1 - 1])
+    decode = Document.resolve(doc, dict["Decode"]) || range
+    data = Document.stream_data(doc, stream) || <<>>
+    {:sampled, domain, range, size, bps, encode, decode, data}
+  end
+
+  defp leaf(doc, 4, dict, stream) do
+    {domain, range} = domain_range(doc, dict)
+    code = Document.stream_data(doc, stream) || ""
+    {:postscript, domain, range, PostScript.parse(code)}
+  end
+
+  defp domain_range(doc, dict) do
+    {Document.resolve(doc, dict["Domain"]) || [0, 1],
+     values(Document.resolve(doc, dict["Range"]))}
+  end
+
+  defp values(list) when is_list(list), do: Enum.take(list, @max_values)
+  defp values(other), do: other
+
+  @doc """
+  An upper bound on the work one `eval/2` takes, in calculator steps (what
+  is not a calculator program counts as 16).
+  """
+  @spec cost(term()) :: pos_integer()
+  def cost({:array, funcs}), do: Enum.reduce(funcs, 16, &(cost(&1) + &2))
+
+  def cost({:stitch, _, _, funcs, bounds, _}),
+    do: 16 + length(funcs) + length(bounds) + Enum.reduce(funcs, 0, &max(cost(&1), &2))
+
+  def cost({:postscript, _, _, program}), do: 16 + PostScript.steps(program)
+  def cost(_), do: 16
 
   @doc "Evaluates a function on a list of inputs, returning a list of outputs."
   @spec eval(term(), [number()]) :: [float()]

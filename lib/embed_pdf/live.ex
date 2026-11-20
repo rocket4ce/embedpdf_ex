@@ -14,6 +14,9 @@ defmodule EmbedPdf.Live do
   The viewer runs as its own nested LiveView process. It sends
   `{:embed_pdf, viewer_id, event}` messages to your LiveView; read the
   edited document back with `EmbedPdf.Store.get(doc_id).doc`.
+
+  A LiveView session is signed but readable by the browser, so `path` and
+  `password` travel encrypted with the endpoint's secret.
   """
   use Phoenix.Component
 
@@ -49,9 +52,8 @@ defmodule EmbedPdf.Live do
     session =
       %{
         "doc_id" => assigns.doc_id,
-        "path" => assigns.path,
-        "name" => assigns.name,
-        "password" => assigns.password,
+        "sealed" => seal(assigns.socket, assigns.path, assigns.password),
+        "name" => assigns.name || (assigns.path && Path.basename(assigns.path)),
         "base_path" => assigns.base_path,
         "locale" => assigns.locale,
         "translations" => assigns.translations,
@@ -75,4 +77,31 @@ defmodule EmbedPdf.Live do
     )}
     """
   end
+
+  @salt "embed_pdf viewer session"
+  @max_age 14 * 24 * 60 * 60
+
+  defp seal(_socket, nil, nil), do: nil
+
+  defp seal(socket, path, password),
+    do: Phoenix.Token.encrypt(endpoint(socket), @salt, %{"path" => path, "password" => password})
+
+  defp endpoint(%Phoenix.LiveView.Socket{endpoint: endpoint}), do: endpoint
+  defp endpoint(%Plug.Conn{} = conn), do: Phoenix.Controller.endpoint_module(conn)
+
+  @doc false
+  # The session the viewer mounts with: what `seal/3` hid, put back.
+  def unseal(%{"sealed" => token} = session, endpoint) when is_binary(token) do
+    case Phoenix.Token.decrypt(endpoint, @salt, token, max_age: @max_age) do
+      {:ok, %{} = secret} ->
+        session
+        |> Map.delete("sealed")
+        |> Map.merge(Map.reject(secret, fn {_, v} -> is_nil(v) end))
+
+      _ ->
+        Map.delete(session, "sealed")
+    end
+  end
+
+  def unseal(session, _endpoint), do: session
 end

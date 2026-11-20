@@ -20,7 +20,20 @@ defmodule EmbedPdf.Font.CMap do
 
   @type t :: %__MODULE__{}
 
+  # Every code of a string is tried against every codespace range. The
+  # predefined CMaps have five at most.
+  @max_codespace_ranges 64
+
   @cmap_dir Path.expand(Path.join([__DIR__, "..", "..", "..", "priv", "cmap"]))
+
+  # the application's priv directory at run time (a release has no source
+  # tree); the source path only serves code loaded outside the application
+  defp cmap_dir do
+    case :code.priv_dir(:embedpdf_ex) do
+      dir when is_list(dir) -> Path.join(List.to_string(dir), "cmap")
+      _ -> @cmap_dir
+    end
+  end
 
   @doc "An Identity-H / Identity-V CMap."
   def identity(wmode \\ 0),
@@ -41,22 +54,44 @@ defmodule EmbedPdf.Font.CMap do
 
     case :persistent_term.get(key, :missing) do
       :missing ->
-        path = Path.join(@cmap_dir, name)
-
-        value =
-          if not String.contains?(name, ["/", ".."]) and File.regular?(path),
-            do: path |> File.read!() |> parse(),
-            else: nil
-
-        :persistent_term.put(key, value)
-        value
+        # the name comes from the PDF: only the names shipped in priv/cmap are
+        # read and cached, so unknown names cost no file access and add no
+        # permanent entry
+        if MapSet.member?(predefined_names(), name) do
+          value = cmap_dir() |> Path.join(name) |> File.read!() |> parse()
+          :persistent_term.put(key, value)
+          value
+        end
 
       value ->
         value
     end
+  rescue
+    _ -> nil
   end
 
   def predefined(_), do: nil
+
+  # the file names of priv/cmap, listed once
+  defp predefined_names do
+    key = {__MODULE__, :names}
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        case File.ls(cmap_dir()) do
+          {:ok, files} ->
+            names = MapSet.new(files, &IO.chardata_to_string/1)
+            :persistent_term.put(key, names)
+            names
+
+          _ ->
+            MapSet.new()
+        end
+
+      names ->
+        names
+    end
+  end
 
   @doc "Parses CMap program text."
   @spec parse(binary(), (String.t() -> t() | nil)) :: t()
@@ -80,7 +115,7 @@ defmodule EmbedPdf.Font.CMap do
     cmap = %__MODULE__{
       name: acc.name,
       wmode: acc.wmode,
-      codespace: Enum.reverse(acc.codespace),
+      codespace: acc.codespace |> Enum.reverse() |> Enum.take(@max_codespace_ranges),
       cid_single: acc.cid_single,
       cid_ranges: acc.cid_ranges |> Enum.sort() |> List.to_tuple(),
       uni_single: acc.uni_single,
@@ -94,7 +129,10 @@ defmodule EmbedPdf.Font.CMap do
     %{
       cmap
       | codespace:
-          if(cmap.codespace == [], do: base.codespace, else: cmap.codespace ++ base.codespace),
+          if(cmap.codespace == [],
+            do: base.codespace,
+            else: Enum.take(cmap.codespace ++ base.codespace, @max_codespace_ranges)
+          ),
         cid_single: Map.merge(base.cid_single, cmap.cid_single),
         cid_ranges:
           (Tuple.to_list(base.cid_ranges) ++ Tuple.to_list(cmap.cid_ranges))
@@ -125,8 +163,14 @@ defmodule EmbedPdf.Font.CMap do
       items
       |> Enum.chunk_every(2, 2, :discard)
       |> Enum.flat_map(fn
-        [{:string, lo}, {:string, hi}] -> [{byte_size(lo), int(lo), int(hi)}]
-        _ -> []
+        # a code is 1 to 4 bytes, the same in both bounds; anything else
+        # (such as the empty `<> <>`) could never match a code
+        [{:string, lo}, {:string, hi}]
+        when byte_size(lo) in 1..4 and byte_size(lo) == byte_size(hi) ->
+          [{byte_size(lo), int(lo), int(hi)}]
+
+        _ ->
+          []
       end)
 
     walk(rest, %{acc | codespace: Enum.reverse(ranges) ++ acc.codespace}, u)
@@ -272,7 +316,8 @@ defmodule EmbedPdf.Font.CMap do
 
       nil ->
         # no range matches: take the shortest length that exists
-        n = cs |> Enum.map(&elem(&1, 0)) |> Enum.min() |> min(byte_size(data))
+        # (always at least one byte, so the split ends)
+        n = cs |> Enum.map(&elem(&1, 0)) |> Enum.min() |> min(byte_size(data)) |> max(1)
         <<code::size(n)-unit(8), rest::binary>> = data
         split(cs, rest, [{code, n} | acc])
     end

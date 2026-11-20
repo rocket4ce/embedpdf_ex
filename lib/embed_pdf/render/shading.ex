@@ -7,13 +7,19 @@ defmodule EmbedPdf.Render.Shading do
       become transparent
     * type 1 (function-based) is sampled into a small PNG
     * types 4–7 (meshes) are approximated by flat-colored triangles
+
+  Painting one is charged to the work budget of the page being drawn
+  (`EmbedPdf.Render.Interpreter.charge/1`) by the colors it has to compute
+  and the mesh data it has to read; when nothing is left it is skipped.
   """
 
   alias EmbedPdf.PDF.{Document, Stream}
-  alias EmbedPdf.Render.{ColorSpace, Matrix, PNG}
+  alias EmbedPdf.Render.{ColorSpace, Interpreter, Matrix, PNG}
   alias EmbedPdf.Render.Function, as: Fun
 
   @stops 32
+  @function_samples 48
+  @max_triangles 20_000
 
   @type paint ::
           {:gradient, iodata()}
@@ -40,19 +46,25 @@ defmodule EmbedPdf.Render.Shading do
       get = &Document.resolve(doc, dict[&1])
       cs = ColorSpace.parse(doc, get.("ColorSpace") || "DeviceGray", resources)
       func = Fun.parse(doc, dict["Function"])
+      # what computing one color takes
+      unit = Fun.cost(func) + ColorSpace.cost(cs)
 
       case get.("ShadingType") do
         2 ->
-          axial(doc, get, cs, func, transform, id)
+          if afford?(@stops + 1, unit), do: axial(doc, get, cs, func, transform, id), else: :skip
 
         3 ->
-          radial(doc, get, cs, func, transform, id)
+          if afford?(@stops + 1, unit), do: radial(doc, get, cs, func, transform, id), else: :skip
 
         1 ->
-          function_based(get, cs, func, transform)
+          if afford?(@function_samples * @function_samples, unit),
+            do: function_based(get, cs, func, transform),
+            else: :skip
 
         t when t in [4, 5, 6, 7] and stream != nil ->
-          mesh(doc, t, dict, stream, cs, func, transform)
+          if afford?(@max_triangles, unit),
+            do: mesh(doc, t, dict, stream, cs, func, transform),
+            else: :skip
 
         _ ->
           :skip
@@ -63,6 +75,8 @@ defmodule EmbedPdf.Render.Shading do
   rescue
     _ -> :skip
   end
+
+  defp afford?(colors, unit), do: Interpreter.charge(div(colors * unit, 16))
 
   defp color(cs, func, t) do
     comps = if func, do: Fun.eval(func, [t]), else: [t]
@@ -184,7 +198,7 @@ defmodule EmbedPdf.Render.Shading do
   defp function_based(get, cs, func, transform) do
     [x0, x1, y0, y1] = nums(get.("Domain"), 4, [0.0, 1.0, 0.0, 1.0])
     m = Matrix.from_pdf(get.("Matrix"))
-    size = 48
+    size = @function_samples
 
     rows =
       for j <- (size - 1)..0//-1 do
@@ -214,7 +228,8 @@ defmodule EmbedPdf.Render.Shading do
     ncomp = if func, do: 1, else: ColorSpace.components(cs)
     decode = nums(get.("Decode"), 4 + 2 * ncomp, nil)
 
-    if decode == nil do
+    # every vertex in the data is read, whatever is drawn of it
+    if decode == nil or not Interpreter.charge(div(byte_size(data), 8)) do
       :skip
     else
       reader = %{bc: bpcoord, bk: bpcomp, bf: bpflag, n: ncomp, decode: decode}
@@ -235,7 +250,7 @@ defmodule EmbedPdf.Render.Shading do
 
       triangles =
         tris
-        |> Enum.take(20_000)
+        |> Enum.take(@max_triangles)
         |> Enum.map(fn {pts, colors} ->
           avg =
             colors

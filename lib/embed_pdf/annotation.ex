@@ -252,6 +252,8 @@ defmodule EmbedPdf.Annotation do
 
   defp default_appearance(doc, dict) do
     da = Edit.untext(Document.resolve(doc, dict["DA"])) || ""
+    # the patterns below backtrack: a real /DA is a few dozen bytes
+    da = binary_part(da, 0, min(byte_size(da), 1024))
     ds = Edit.untext(Document.resolve(doc, dict["DS"])) || ""
 
     size =

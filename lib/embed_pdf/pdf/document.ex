@@ -19,6 +19,14 @@ defmodule EmbedPdf.PDF.Document do
             reconstructed?: false,
             byte_size: 0
 
+  # Page trees nested deeper than this are not followed (PDFium's limit).
+  @max_page_depth 1024
+
+  # An object stream is parsed into terms several times its decoded size, so
+  # it gets less room than other streams. Writers put a few hundred objects
+  # in each; this is thousands of times that.
+  @max_object_stream_bytes 64_000_000
+
   @type t :: %__MODULE__{
           objects: %{non_neg_integer() => term()},
           trailer: map(),
@@ -113,6 +121,18 @@ defmodule EmbedPdf.PDF.Document do
   defp ref_num({:ref, n, _}), do: n
   defp ref_num(_), do: nil
 
+  @doc """
+  The most pages a document is read with: `config :embedpdf_ex, max_pages:
+  100_000`. The page tree of a larger document is cut there.
+  """
+  @spec max_pages() :: pos_integer()
+  def max_pages do
+    case Application.get_env(:embedpdf_ex, :max_pages, 100_000) do
+      n when is_integer(n) and n > 0 -> n
+      _ -> 100_000
+    end
+  end
+
   defp retry_reconstructed(data, objects, trailer, crypt, true),
     do: expand_all(data, objects, trailer, crypt)
 
@@ -123,14 +143,13 @@ defmodule EmbedPdf.PDF.Document do
   end
 
   # with a rebuilt table, objects living in object streams must be pulled out
-  defp expand_all(_data, objects, trailer, _crypt) do
-    objects =
+  defp expand_all(data, objects, trailer, _crypt) do
+    {objects, _budget} =
       objects
       |> Enum.filter(fn {_, v} -> match?(%Stream{dict: %{"Type" => "ObjStm"}}, v) end)
-      |> Enum.reduce(objects, fn {_, stm}, acc ->
-        stm
-        |> object_stream_objects()
-        |> Enum.reduce(acc, fn {n, v}, acc -> Map.put_new(acc, n, v) end)
+      |> Enum.reduce({objects, Xref.decode_budget(data)}, fn {_, stm}, {acc, budget} ->
+        {found, budget} = object_stream_objects(stm, budget)
+        {Enum.reduce(found, acc, fn {n, v}, acc -> Map.put_new(acc, n, v) end), budget}
       end)
 
     trailer =
@@ -186,7 +205,7 @@ defmodule EmbedPdf.PDF.Document do
 
   defp load_raw(data, entries, num) do
     case entries[num] do
-      {:offset, off, _} ->
+      {:offset, off, _} when off < byte_size(data) ->
         case Parser.parse_indirect(binary_part(data, off, byte_size(data) - off)) do
           {:ok, _, _, value} -> value
           _ -> nil
@@ -197,97 +216,148 @@ defmodule EmbedPdf.PDF.Document do
     end
   end
 
+  # An indirect `/Length` is asked for by every stream that has one, so only
+  # the start of its object is read: `N G obj 1234 endobj` and no further.
+  @length_window 512
+
+  defp load_length(data, entries, num) do
+    with {:offset, off, _} when off < byte_size(data) <- entries[num],
+         avail = byte_size(data) - off,
+         window = binary_part(data, off, min(avail, @length_window)),
+         {:ok, _num, _gen, rest} <- Parser.indirect_header(window),
+         {len, rest} when is_integer(len) <- Parser.parse_value(rest),
+         # at the cut edge of the window the token may not be whole
+         true <- avail <= @length_window or byte_size(rest) >= 32 do
+      len
+    else
+      _ -> nil
+    end
+  end
+
   # ---------------------------------------------------------------- objects
 
   defp load_objects(data, entries, crypt, trailer, reconstructed?) do
     encrypt_num = ref_num(trailer["Encrypt"])
+    length_fun = fn {:ref, n, _} -> load_length(data, entries, n) end
 
-    length_fun = fn {:ref, n, _} ->
-      case load_raw(data, entries, n) do
-        len when is_integer(len) -> len
-        _ -> nil
-      end
-    end
+    # Objects are parsed from their offset on. In a real file they follow
+    # each other and the bytes read add up to the size of the file; offsets
+    # that point into each other (or streams that never end) run out of
+    # budget instead, and what is left is not loaded.
+    {direct, _budget} =
+      Enum.reduce(entries, {%{}, Xref.work_budget(data)}, fn
+        {num, {:offset, off, gen}}, {acc, budget} when off < byte_size(data) and budget > 0 ->
+          object = binary_part(data, off, byte_size(data) - off)
 
-    direct =
-      for {num, {:offset, off, gen}} <- entries,
-          off < byte_size(data),
-          reduce: %{} do
-        acc ->
-          case Parser.parse_indirect(binary_part(data, off, byte_size(data) - off), length_fun) do
-            {:ok, n, _g, value} when n == num or reconstructed? ->
+          case Parser.parse_indirect_within(object, length_fun, budget) do
+            {{:ok, n, _g, value}, budget} when n == num or reconstructed? ->
               value =
                 if crypt && num != encrypt_num,
                   do: decrypt_object(value, crypt, num, gen),
                   else: value
 
-              Map.put(acc, num, value)
+              {Map.put(acc, num, value), budget}
 
-            _ ->
-              acc
+            {_, budget} ->
+              {acc, budget}
           end
-      end
+
+        _entry, state ->
+          state
+      end)
 
     compressed =
       entries
       |> Enum.filter(fn {_, e} -> match?({:compressed, _, _}, e) end)
       |> Enum.group_by(fn {_, {:compressed, stm, _}} -> stm end, fn {num, _} -> num end)
 
-    Enum.reduce(compressed, direct, fn {stm_num, nums}, acc ->
-      case direct[stm_num] do
-        %Stream{} = stm ->
-          wanted = MapSet.new(nums)
+    {objects, _budget} =
+      Enum.reduce(compressed, {direct, Xref.decode_budget(data)}, fn
+        {stm_num, nums}, {acc, budget} ->
+          case direct[stm_num] do
+            %Stream{} = stm ->
+              wanted = MapSet.new(nums)
+              {found, budget} = object_stream_objects(stm, budget)
 
-          stm
-          |> object_stream_objects()
-          |> Enum.reduce(acc, fn {n, v}, acc ->
-            if MapSet.member?(wanted, n), do: Map.put(acc, n, v), else: acc
-          end)
+              acc =
+                Enum.reduce(found, acc, fn {n, v}, acc ->
+                  if MapSet.member?(wanted, n), do: Map.put(acc, n, v), else: acc
+                end)
 
-        _ ->
-          acc
-      end
-    end)
+              {acc, budget}
+
+            _ ->
+              {acc, budget}
+          end
+      end)
+
+    objects
   end
 
   @doc false
-  def object_stream_objects(%Stream{dict: dict, raw: raw}) do
-    decoded = Filter.decode!(raw, dict["Filter"], dict["DecodeParms"])
-    n = Map.get(dict, "N", 0)
-    first = Map.get(dict, "First", 0)
+  def object_stream_objects(%Stream{} = stm),
+    do: stm |> object_stream_objects(Filter.max_bytes()) |> elem(0)
 
-    if first > byte_size(decoded) do
-      []
-    else
-      header = binary_part(decoded, 0, first)
-      body = binary_part(decoded, first, byte_size(decoded) - first)
-      pairs = read_pairs(header, n, [])
+  # The objects of an object stream and what is left of `budget`, the bytes
+  # that the object streams of a file may still decode to.
+  defp object_stream_objects(%Stream{dict: dict, raw: raw}, budget) do
+    limit = budget |> min(Filter.max_bytes()) |> min(@max_object_stream_bytes)
 
-      Enum.flat_map(pairs, fn {num, off} ->
-        if off <= byte_size(body) do
-          case Parser.parse_value(binary_part(body, off, byte_size(body) - off)) do
-            {value, _} -> [{num, value}]
-            :eof -> []
-          end
-        else
-          []
-        end
-      end)
+    case Filter.decode_within(raw, dict["Filter"], dict["DecodeParms"], limit) do
+      {:ok, {decoded, _}} -> {read_object_stream(dict, decoded), budget - byte_size(decoded)}
+      :too_large -> {[], budget - limit}
     end
   end
 
-  defp read_pairs(_input, 0, acc), do: Enum.reverse(acc)
+  defp read_object_stream(dict, decoded) do
+    n = dict["N"]
+    first = dict["First"]
+
+    if is_integer(n) and is_integer(first) and first >= 0 and first <= byte_size(decoded) do
+      header = binary_part(decoded, 0, first)
+      body = binary_part(decoded, first, byte_size(decoded) - first)
+
+      # objects that overlap share a budget of bytes, as in load_objects
+      {objects, _budget} =
+        header
+        |> read_pairs(n, [])
+        |> Enum.reduce({[], 8 * byte_size(body) + 65_536}, fn
+          {num, off}, {acc, budget} when off >= 0 and off <= byte_size(body) and budget > 0 ->
+            window = binary_part(body, off, min(byte_size(body) - off, budget))
+
+            case Parser.parse_value(window) do
+              {value, rest} ->
+                {[{num, value} | acc], budget - max(byte_size(window) - byte_size(rest), 1)}
+
+              :eof ->
+                {acc, budget - max(byte_size(window), 1)}
+            end
+
+          _pair, state ->
+            state
+        end)
+
+      Enum.reverse(objects)
+    else
+      []
+    end
+  end
+
+  # `number offset` pairs, as many as `/N` says and the header holds
+  defp read_pairs(_input, n, acc) when n <= 0, do: Enum.reverse(acc)
 
   defp read_pairs(input, n, acc) do
-    rest = Parser.skip_ws(input)
-
-    with {num, r} when is_integer(num) <- Parser.parse_number(rest),
-         {off, r} when is_integer(off) <- Parser.parse_number(Parser.skip_ws(r)) do
+    with {num, r} when is_integer(num) <- unsigned(Parser.skip_ws(input)),
+         {off, r} when is_integer(off) <- unsigned(Parser.skip_ws(r)) do
       read_pairs(r, n - 1, [{num, off} | acc])
     else
       _ -> Enum.reverse(acc)
     end
   end
+
+  # read as a number, anything else would be 0 and never be passed
+  defp unsigned(<<c, _::binary>> = input) when c in ?0..?9, do: Parser.parse_number(input)
+  defp unsigned(_), do: :error
 
   defp decrypt_object(%Stream{dict: dict, raw: raw} = s, crypt, num, gen) do
     cond do
@@ -404,10 +474,12 @@ defmodule EmbedPdf.PDF.Document do
   def refresh_pages(doc) do
     root = get(doc, catalog(doc), "Pages")
     root_ref = catalog(doc)["Pages"]
+    walk = %{pages: [], count: 0, seen: MapSet.new(), max: max_pages()}
 
     pages =
       doc
-      |> walk_pages(root_ref, root, %{}, MapSet.new(), [])
+      |> walk_pages(root_ref, root, %{}, walk, 0)
+      |> Map.fetch!(:pages)
       |> Enum.reverse()
       |> Enum.with_index()
       |> Enum.map(fn {{ref, dict, inherited}, i} -> Page.new(doc, i, ref, dict, inherited) end)
@@ -418,32 +490,43 @@ defmodule EmbedPdf.PDF.Document do
 
   @inheritable ~w(Resources MediaBox CropBox Rotate)
 
-  defp walk_pages(doc, ref, node, inherited, seen, acc) when is_map(node) do
-    key = ref || make_ref()
+  # `walk` goes through the whole tree: a `/Pages` node is entered once,
+  # however many `/Kids` arrays list it, so the pages found cannot outnumber
+  # the entries of those arrays.
+  defp walk_pages(_doc, _ref, _node, _inherited, %{count: count, max: max} = walk, _depth)
+       when count >= max,
+       do: walk
 
-    if MapSet.member?(seen, key) do
-      acc
-    else
-      seen = MapSet.put(seen, key)
+  defp walk_pages(doc, ref, node, inherited, walk, depth)
+       when is_map(node) and not is_struct(node) do
+    inherited =
+      Enum.reduce(@inheritable, inherited, fn k, inh ->
+        if Map.has_key?(node, k), do: Map.put(inh, k, node[k]), else: inh
+      end)
 
-      inherited =
-        Enum.reduce(@inheritable, inherited, fn k, inh ->
-          if Map.has_key?(node, k), do: Map.put(inh, k, node[k]), else: inh
-        end)
+    case {node["Type"], resolve(doc, node["Kids"])} do
+      {type, kids} when is_list(kids) and type != "Page" ->
+        key = with {:ref, n, _} <- ref, do: n
 
-      case {node["Type"], resolve(doc, node["Kids"])} do
-        {type, kids} when is_list(kids) and type != "Page" ->
-          Enum.reduce(kids, acc, fn kid, acc ->
-            walk_pages(doc, kid, resolve(doc, kid), inherited, seen, acc)
-          end)
+        cond do
+          depth >= @max_page_depth or MapSet.member?(walk.seen, key) ->
+            walk
 
-        _ ->
-          [{ref, node, inherited} | acc]
-      end
+          true ->
+            # a node written in place of a reference can only be reached once
+            walk = if is_integer(key), do: %{walk | seen: MapSet.put(walk.seen, key)}, else: walk
+
+            Enum.reduce(kids, walk, fn kid, walk ->
+              walk_pages(doc, kid, resolve(doc, kid), inherited, walk, depth + 1)
+            end)
+        end
+
+      _ ->
+        %{walk | pages: [{ref, node, inherited} | walk.pages], count: walk.count + 1}
     end
   end
 
-  defp walk_pages(_doc, _ref, _node, _inherited, _seen, acc), do: acc
+  defp walk_pages(_doc, _ref, _node, _inherited, walk, _depth), do: walk
 
   # a broken page tree: collect every /Type /Page object in object order
   defp fallback_pages(doc) do

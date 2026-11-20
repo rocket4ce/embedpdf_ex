@@ -407,6 +407,7 @@ defmodule EmbedPdf.Text do
       graphemes = pt.chars |> Tuple.to_list() |> Enum.map(&normalize_char(&1.text))
       haystack = Enum.join(graphemes)
       offsets = grapheme_offsets(graphemes)
+
       pattern =
         query
         |> expand_ligatures()

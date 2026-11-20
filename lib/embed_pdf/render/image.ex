@@ -7,14 +7,30 @@ defmodule EmbedPdf.Render.Image do
 
   JPEG 2000 and JBIG2 images are not decoded; `prepare/4` reports them as
   `{:placeholder, kind}`.
+
+  ## Limits
+
+  An image's size comes from its dictionary, not from its data, so it is
+  checked before anything is decoded or padded: samples that would take
+  more than `:max_image_bytes` (width × height × components × bits / 8;
+  default 64 MB) make the image, stencil mask or soft mask a
+  `{:placeholder, :too_large}`, and so does an image past the page's share
+  (`EmbedPdf.Render.Interpreter.new_budget/0`). JPEG data is passed on as
+  it is and has no such limit.
+
+      config :embedpdf_ex, max_image_bytes: 64_000_000
   """
 
   import Bitwise
 
   alias EmbedPdf.PDF.{Document, Filter, Stream}
-  alias EmbedPdf.Render.{CCITT, ColorSpace, PNG}
+  alias EmbedPdf.Render.{CCITT, ColorSpace, Interpreter, PNG}
 
   @max_side 4000
+  @default_max_bytes 64_000_000
+  # filters whose data is not decoded here
+  @encoded ~w(DCTDecode DCT JPXDecode JBIG2Decode)
+  @slow_weight 8
 
   @type prepared :: %{
           href: String.t(),
@@ -47,7 +63,24 @@ defmodule EmbedPdf.Render.Image do
     end
   rescue
     _ -> :skip
+  catch
+    :too_large -> {:placeholder, :too_large}
   end
+
+  defp max_bytes do
+    case Application.get_env(:embedpdf_ex, :max_image_bytes, @default_max_bytes) do
+      n when is_integer(n) and n > 0 -> n
+      _ -> @default_max_bytes
+    end
+  end
+
+  # Lets `bytes` of samples (at most `limit`) into memory, or gives the
+  # image up.
+  defp admit(bytes, limit \\ max_bytes()) do
+    if bytes > limit or not Interpreter.charge_image(bytes), do: throw(:too_large), else: :ok
+  end
+
+  defp encoded?(dict), do: Enum.any?(List.wrap(dict["Filter"]), &(&1 in @encoded))
 
   defp parts(doc, %Stream{dict: dict, raw: raw}), do: {resolve_dict(doc, dict), raw}
   defp parts(doc, %{dict: dict, data: data}), do: {resolve_dict(doc, dict), data}
@@ -88,7 +121,7 @@ defmodule EmbedPdf.Render.Image do
   defp ccitt(data, params, dict) do
     params = if is_map(params), do: params, else: %{}
 
-    case CCITT.decode(data, params, int(dict["Width"]), int(dict["Height"])) do
+    case CCITT.decode(data, params, int(dict["Width"]), int(dict["Height"]), max_bytes()) do
       {:ok, bits} -> {:raw, bits}
       :error -> {:placeholder, :ccitt}
     end
@@ -97,6 +130,8 @@ defmodule EmbedPdf.Render.Image do
   # ---------------------------------------------------------------- stencil masks
 
   defp stencil(_doc, dict, raw, w, h, {r, g, b}) do
+    admit(div(w + 7, 8) * h)
+
     case decode_data(dict, raw) do
       {:raw, data} ->
         paint = {round(r * 255), round(g * 255), round(b * 255)}
@@ -120,6 +155,11 @@ defmodule EmbedPdf.Render.Image do
     cs = image_color_space(doc, dict, resources)
     bpc = int(dict["BitsPerComponent"] || 8)
     bpc = if bpc in [1, 2, 4, 8, 16], do: bpc, else: 8
+    # CCITT data is 1-bit regardless of what the dictionary claims
+    {cs, bpc} = if ccitt?(dict), do: {:gray, 1}, else: {cs, bpc}
+    bytes = div(w * ColorSpace.components(cs) * bpc + 7, 8) * h
+    encoded? = encoded?(dict)
+    if not encoded?, do: admit(bytes)
 
     case decode_data(dict, raw) do
       {:jpeg, data} ->
@@ -135,9 +175,7 @@ defmodule EmbedPdf.Render.Image do
          }}
 
       {:raw, data} ->
-        # CCITT data is 1-bit regardless of what the dictionary claims
-        bpc = if ccitt?(dict), do: 1, else: bpc
-        cs = if ccitt?(dict), do: :gray, else: cs
+        if encoded?, do: admit(bytes)
         {png, color_key_mask} = to_png(dict, data, w, h, cs, bpc)
         mask = color_key_mask || mask_for(doc, dict, w, h, data, cs, bpc)
 
@@ -267,45 +305,99 @@ defmodule EmbedPdf.Render.Image do
     end
 
     row_bytes = div(w * n * bpc + 7, 8)
+    # every pixel becomes three bytes, however few bits it had
+    admit(w * h * 3, 4 * max_bytes())
+
+    convert = fn px ->
+      px |> Enum.with_index() |> Enum.map(fn {s, i} -> to_value.(i, s) end) |> rgb_bytes.()
+    end
 
     out =
-      if n == 1 and bpc <= 8 do
-        table = for(s <- 0..max, do: rgb_bytes.([to_value.(0, s)])) |> List.to_tuple()
+      cond do
+        n == 1 and bpc <= 8 ->
+          table = for(s <- 0..max, do: rgb_bytes.([to_value.(0, s)])) |> List.to_tuple()
+          lookup(data, w, bpc, row_bytes, table)
 
-        for <<row::binary-size(row_bytes) <- data>>, into: <<>> do
-          row_samples(row, w, bpc) |> Enum.map(&elem(table, &1)) |> IO.iodata_to_binary()
-        end
-      else
-        {out, _cache} =
-          for <<row::binary-size(row_bytes) <- data>>, reduce: {[], %{}} do
-            {acc, cache} ->
-              samples = row_samples(row, w * n, bpc)
+        bpc >= 8 ->
+          # every pixel may need converting, which is slow: such images get a
+          # smaller part of the page's share
+          if not Interpreter.charge_image(w * h * 3 * @slow_weight), do: throw(:too_large)
+          # whole bytes: pixels are taken straight from the data
+          convert_bytes(data, n * div(bpc, 8), bpc, convert, %{}, <<>>)
 
-              {pixels, cache} =
-                samples
-                |> Enum.chunk_every(n)
-                |> Enum.map_reduce(cache, fn px, cache ->
-                  case Map.fetch(cache, px) do
-                    {:ok, v} ->
-                      {v, cache}
+        w * h > @max_side * @max_side ->
+          throw(:too_large)
 
-                    :error ->
-                      comps =
-                        px |> Enum.with_index() |> Enum.map(fn {s, i} -> to_value.(i, s) end)
+        true ->
+          {out, _cache} =
+            for <<row::binary-size(row_bytes) <- data>>, reduce: {[], %{}} do
+              {acc, cache} ->
+                samples = row_samples(row, w * n, bpc)
 
-                      v = rgb_bytes.(comps)
-                      cache = if map_size(cache) < 65_536, do: Map.put(cache, px, v), else: cache
-                      {v, cache}
-                  end
-                end)
+                {pixels, cache} =
+                  samples
+                  |> Enum.chunk_every(n)
+                  |> Enum.map_reduce(cache, fn px, cache ->
+                    case Map.fetch(cache, px) do
+                      {:ok, v} ->
+                        {v, cache}
 
-              {[acc | pixels], cache}
-          end
+                      :error ->
+                        v = convert.(px)
 
-        IO.iodata_to_binary(out)
+                        cache =
+                          if map_size(cache) < 65_536, do: Map.put(cache, px, v), else: cache
+
+                        {v, cache}
+                    end
+                  end)
+
+                {[acc | IO.iodata_to_binary(pixels)], cache}
+            end
+
+          IO.iodata_to_binary(out)
       end
 
     downsample_png(w, h, :rgb, 8, out)
+  end
+
+  # one component of 8 bits or fewer: `table` has the color of every sample
+  defp lookup(data, _w, 8, _row_bytes, table),
+    do: for(<<s <- data>>, into: <<>>, do: elem(table, s))
+
+  defp lookup(data, w, bpc, row_bytes, table) do
+    # the colors of the pixels in a byte, for every byte
+    bytes =
+      for b <- 0..255 do
+        byte = <<b>>
+        for <<s::size(bpc) <- byte>>, into: <<>>, do: elem(table, s)
+      end
+      |> List.to_tuple()
+
+    for <<row::binary-size(row_bytes) <- data>>, into: <<>> do
+      colors = for <<b <- row>>, into: <<>>, do: elem(bytes, b)
+      binary_part(colors, 0, w * 3)
+    end
+  end
+
+  # Pixels of `size` whole bytes; the colors of the first 65536 different
+  # ones are remembered.
+  defp convert_bytes(data, size, bpc, convert, cache, out) do
+    case data do
+      <<px::binary-size(size), rest::binary>> ->
+        case cache do
+          %{^px => v} ->
+            convert_bytes(rest, size, bpc, convert, cache, <<out::binary, v::binary>>)
+
+          _ ->
+            v = convert.(for <<s::size(bpc) <- px>>, do: s)
+            cache = if map_size(cache) < 65_536, do: Map.put(cache, px, v), else: cache
+            convert_bytes(rest, size, bpc, convert, cache, <<out::binary, v::binary>>)
+        end
+
+      _ ->
+        out
+    end
   end
 
   defp row_samples(row, count, bpc) do
@@ -381,6 +473,7 @@ defmodule EmbedPdf.Render.Image do
     h = int(dict["Height"])
     bpc = int(dict["BitsPerComponent"] || 8)
     bpc = if bpc in [1, 2, 4, 8, 16], do: bpc, else: 8
+    if not encoded?(dict), do: admit(div(w * bpc + 7, 8) * max(h, 0))
 
     case decode_data(dict, raw) do
       {:raw, data} when w > 0 and h > 0 ->
@@ -425,6 +518,7 @@ defmodule EmbedPdf.Render.Image do
     {dict, raw} = parts(doc, s)
     w = int(dict["Width"])
     h = int(dict["Height"])
+    admit(div(w + 7, 8) * max(h, 0))
 
     case decode_data(dict, raw) do
       {:raw, data} when w > 0 and h > 0 ->

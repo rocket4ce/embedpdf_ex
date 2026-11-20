@@ -7,7 +7,15 @@ defmodule EmbedPdf.Font.Program do
   (`EmbedPdf.Font.TrueType`, `EmbedPdf.Font.CFF`, `EmbedPdf.Font.Type1`).
   The program format is sniffed from the bytes, since PDFs often label it
   wrongly. Every function returns nil when it cannot help, and callers fall
-  back. Parsed programs are memoized by content hash.
+  back.
+
+  Parsed programs and decoded outlines are memoized in an ETS table shared
+  by every document, keyed by a SHA-256 of the font stream (so one
+  document cannot stand in for another's font). The table is emptied when
+  it passes 12,000 entries or `config :embedpdf_ex, font_cache_bytes: …`
+  (256 MB by default, a rough count). Font programs larger than
+  `config :embedpdf_ex, max_font_bytes: …` (30 MB by default) are not
+  parsed: such a font draws with the fallback of a font without a program.
 
   Glyph selection follows what pdf.js and PDFium do for each font kind.
   """
@@ -22,6 +30,10 @@ defmodule EmbedPdf.Font.Program do
   @table :embed_pdf_font_programs
   @owner :embed_pdf_font_program_cache
   @max_entries 12_000
+  # the row of the table that counts the bytes held by the others
+  @bytes_key :"$bytes"
+  # largest `{filters, parameters}` of a font stream that is identified
+  @max_decoding_bytes 4_096
 
   @doc "Parses the font program referenced by a font descriptor, or nil."
   @spec load(Document.t(), map(), String.t()) :: t() | nil
@@ -34,23 +46,22 @@ defmodule EmbedPdf.Font.Program do
         end
       end)
 
-    case stream do
+    case stream && stream_id(doc, stream) do
       nil ->
         nil
 
-      %Stream{raw: raw, dict: dict} ->
-        key = {:crypto.hash(:md5, raw), byte_size(raw), :erlang.phash2(dict["Filter"])}
-
-        memo(key, fn ->
+      id ->
+        # the id is computed here, once per font; outlines are cached under it
+        memo({:program, id}, fn ->
           case Document.stream_data(doc, stream) do
             bytes when is_binary(bytes) and byte_size(bytes) > 4 ->
               case parse(bytes) do
-                %__MODULE__{} = p -> %{p | id: :erlang.phash2(key)}
-                nil -> nil
+                %__MODULE__{} = p -> {%{p | id: id}, byte_size(bytes)}
+                nil -> {nil, 0}
               end
 
             _ ->
-              nil
+              {nil, 0}
           end
         end)
     end
@@ -60,10 +71,38 @@ defmodule EmbedPdf.Font.Program do
 
   def load(_doc, _descriptor, _subtype), do: nil
 
+  # Identifies the decoded font program without decoding it: a SHA-256 over
+  # the stored bytes and everything `Document.stream_data/2` decodes them
+  # with (the filters and their parameters, resolved the same way). Two
+  # streams with the same id decode to the same program, and making another
+  # stream with a given id means breaking SHA-256.
+  defp stream_id(doc, %Stream{raw: raw, dict: dict}) when is_binary(raw) do
+    decoding =
+      {resolve_shallow(doc, dict["Filter"]), resolve_shallow(doc, dict["DecodeParms"]),
+       resolve_shallow(doc, dict["DP"])}
+
+    # (a real font stream has a filter name or two here)
+    if :erlang.external_size(decoding) <= @max_decoding_bytes do
+      :crypto.hash(:sha256, [<<byte_size(raw)::64>>, raw, :erlang.term_to_binary(decoding)])
+    end
+  end
+
+  defp stream_id(_doc, _stream), do: nil
+
+  defp resolve_shallow(doc, value) do
+    case Document.resolve(doc, value) do
+      list when is_list(list) -> Enum.map(list, &Document.resolve(doc, &1))
+      other -> other
+    end
+  end
+
   @doc "Parses font program bytes of any supported format."
   @spec parse(binary()) :: t() | nil
-  def parse(bytes) do
+  def parse(bytes) when is_binary(bytes) do
     cond do
+      byte_size(bytes) > max_font_bytes() ->
+        nil
+
       TrueType.sfnt?(bytes) ->
         case TrueType.parse(bytes) do
           {:ok, %TrueType{cff: %CFF{} = cff} = tt} ->
@@ -95,8 +134,19 @@ defmodule EmbedPdf.Font.Program do
     _ -> nil
   end
 
+  def parse(_), do: nil
+
+  defp max_font_bytes do
+    case Application.get_env(:embedpdf_ex, :max_font_bytes, 30_000_000) do
+      n when is_integer(n) and n >= 0 -> n
+      _ -> 30_000_000
+    end
+  end
+
   # ---------------------------------------------------------------- cache
 
+  # `fun` returns `{value, extra_bytes}`: the bytes the value keeps alive
+  # outside its own term (the font data its binaries are slices of).
   defp memo(key, fun) do
     table = ensure_table()
 
@@ -105,18 +155,42 @@ defmodule EmbedPdf.Font.Program do
         value
 
       _ ->
-        value = fun.()
+        {value, extra} = fun.()
+        if table, do: store(table, key, value, extra)
+        value
+    end
+  end
 
-        if table do
-          try do
-            if :ets.info(table, :size) >= @max_entries, do: :ets.delete_all_objects(table)
-            :ets.insert(table, {key, value})
-          rescue
-            _ -> :ok
-          end
+  # The table has an entry cap and a rough byte budget; when either is
+  # passed it is emptied. A value that would take more than half the budget
+  # on its own is not kept.
+  defp store(table, key, value, extra) do
+    budget = cache_bytes()
+    cost = extra + :erts_debug.flat_size({key, value}) * :erlang.system_info(:wordsize)
+
+    if cost <= div(budget, 2) do
+      used =
+        case :ets.lookup(table, @bytes_key) do
+          [{_, n}] -> n
+          [] -> 0
         end
 
-        value
+      if used + cost > budget or :ets.info(table, :size) >= @max_entries,
+        do: :ets.delete_all_objects(table)
+
+      :ets.insert(table, {key, value})
+      :ets.update_counter(table, @bytes_key, cost, {@bytes_key, 0})
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp cache_bytes do
+    case Application.get_env(:embedpdf_ex, :font_cache_bytes, 256_000_000) do
+      n when is_integer(n) and n >= 0 -> n
+      _ -> 256_000_000
     end
   end
 
@@ -275,8 +349,8 @@ defmodule EmbedPdf.Font.Program do
         unicode_code_lookup(tt, code, font)
 
     cond do
-      (gid && gid > 0) and gid < max(tt.num_glyphs, 1) -> gid
-      (gid && gid > 0) and tt.num_glyphs == 0 -> gid
+      is_integer(gid) and gid > 0 and gid < max(tt.num_glyphs, 1) -> gid
+      is_integer(gid) and gid > 0 and tt.num_glyphs == 0 -> gid
       map_size(tt.cmaps) == 0 and code < tt.num_glyphs -> code
       true -> nil
     end
@@ -403,7 +477,7 @@ defmodule EmbedPdf.Font.Program do
 
   # decoded outlines are memoized next to the parsed programs
   defp cached_outline(nil, _sel, fun), do: fun.()
-  defp cached_outline(id, sel, fun), do: memo({:outline, id, sel}, fun)
+  defp cached_outline(id, sel, fun), do: memo({:outline, id, sel}, fn -> {fun.(), 0} end)
 
   defp alternate_name_glyph(name, fun) do
     case GlyphList.to_unicode(name) do

@@ -60,6 +60,8 @@ defmodule EmbedPdf.Font.GlyphList do
   @spec to_unicode(String.t(), boolean()) :: String.t() | nil
   def to_unicode(name, zapf? \\ false)
   def to_unicode(nil, _), do: nil
+  # (glyph names are at most 63 characters; this is called for every glyph shown)
+  def to_unicode(name, _) when byte_size(name) > 255, do: nil
 
   def to_unicode(name, true) do
     Map.get(@zapf_names, name) || to_unicode(name, false)

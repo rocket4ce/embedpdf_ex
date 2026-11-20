@@ -12,23 +12,71 @@ defmodule EmbedPdf.PDF.Filter do
 
   @image_filters ~w(DCTDecode DCT JPXDecode JBIG2Decode CCITTFaxDecode CCF)
 
+  # a longer chain is not a real stream, it is a decompression bomb
+  @max_filters 8
+
+  # Predictor rows: what real images and cross-reference streams stay within.
+  # A row is unfiltered as lists, a hundred times its size, so rows are far
+  # smaller than streams: 2 MB is 250 000 pixels of 16-bit CMYK across.
+  @max_columns 1_000_000
+  @max_row_bytes 2_000_000
+
+  @doc """
+  The largest decoded size of one stream, in bytes: `config :embedpdf_ex,
+  max_stream_bytes: 256_000_000`. A stream that would decode to more comes
+  back empty.
+  """
+  @spec max_bytes() :: pos_integer()
+  def max_bytes do
+    case Application.get_env(:embedpdf_ex, :max_stream_bytes, 256_000_000) do
+      n when is_integer(n) and n > 0 -> n
+      _ -> 256_000_000
+    end
+  end
+
   @doc """
   Decodes `data` through `filters` (a name or list of names) with their
   `params` (a dict, a list of dicts or nil).
 
   Returns `{decoded, nil}` when fully decoded, or `{partially_decoded,
-  {image_filter, params}}` when an image filter remains.
+  {image_filter, params}}` when an image filter remains. A stream that
+  decodes to more than `max_bytes/0` at any step of the chain, or that has
+  more than #{@max_filters} filters, decodes to `{"", nil}`.
   """
   @spec decode(binary(), term(), term()) :: {binary(), nil | {binary(), map()}}
   def decode(data, filters, params) do
-    filters = List.wrap(filters)
-    params = normalize_params(params, length(filters))
-    run(data, Enum.zip(filters, params))
+    case decode_within(data, filters, params, max_bytes()) do
+      {:ok, result} -> result
+      :too_large -> {<<>>, nil}
+    end
   end
 
   @doc "Decodes completely, leaving image-codec data as is."
   @spec decode!(binary(), term(), term()) :: binary()
   def decode!(data, filters, params), do: data |> decode(filters, params) |> elem(0)
+
+  @doc """
+  `decode/3` with an explicit size limit, telling a stream that went over it
+  (`:too_large`) from one that decoded.
+  """
+  @spec decode_within(binary(), term(), term(), integer()) ::
+          {:ok, {binary(), nil | {binary(), map()}}} | :too_large
+  def decode_within(data, filters, params, max) do
+    filters = List.wrap(filters)
+    count = length(filters)
+
+    if count > @max_filters or max <= 0 do
+      :too_large
+    else
+      params = normalize_params(params, count)
+
+      try do
+        {:ok, run(data, Enum.zip(filters, params), max)}
+      catch
+        :throw, :embedpdf_stream_too_large -> :too_large
+      end
+    end
+  end
 
   defp normalize_params(nil, n), do: List.duplicate(%{}, n)
   defp normalize_params(p, n) when is_map(p), do: [p | List.duplicate(%{}, max(n - 1, 0))]
@@ -40,14 +88,14 @@ defmodule EmbedPdf.PDF.Filter do
 
   defp normalize_params(_, n), do: List.duplicate(%{}, n)
 
-  defp run(data, []), do: {data, nil}
+  defp run(data, [], _max), do: {data, nil}
 
-  defp run(data, [{name, params} | rest]) when name in @image_filters do
-    if rest == [], do: {data, {canonical(name), params}}, else: run(data, rest)
+  defp run(data, [{name, params} | rest], max) when name in @image_filters do
+    if rest == [], do: {data, {canonical(name), params}}, else: run(data, rest, max)
   end
 
-  defp run(data, [{name, params} | rest]) do
-    run(apply_filter(name, data, params), rest)
+  defp run(data, [{name, params} | rest], max) do
+    run(filter(name, data, params, max), rest, max)
   end
 
   defp canonical("DCT"), do: "DCTDecode"
@@ -55,42 +103,69 @@ defmodule EmbedPdf.PDF.Filter do
   defp canonical(name), do: name
 
   @doc false
-  def apply_filter(name, data, params) when name in ["FlateDecode", "Fl"],
-    do: data |> inflate() |> predict(params)
-
-  def apply_filter(name, data, params) when name in ["LZWDecode", "LZW"] do
-    early = Map.get(params, "EarlyChange", 1)
-    data |> lzw(early) |> predict(params)
+  def apply_filter(name, data, params) do
+    filter(name, data, params, max_bytes())
+  catch
+    :throw, :embedpdf_stream_too_large -> <<>>
   end
 
-  def apply_filter(name, data, _) when name in ["ASCIIHexDecode", "AHx"], do: ascii_hex(data)
-  def apply_filter(name, data, _) when name in ["ASCII85Decode", "A85"], do: ascii85(data)
-  def apply_filter(name, data, _) when name in ["RunLengthDecode", "RL"], do: run_length(data, [])
-  def apply_filter("Crypt", data, _), do: data
-  def apply_filter(_unknown, data, _), do: data
+  # every filter throws :embedpdf_stream_too_large once its output passes `max`
+  defp filter(name, data, params, max) when name in ["FlateDecode", "Fl"],
+    do: data |> inflate(max) |> predict(params)
+
+  defp filter(name, data, params, max) when name in ["LZWDecode", "LZW"] do
+    early = if Map.get(params, "EarlyChange", 1) == 0, do: 0, else: 1
+    data |> lzw(early, max) |> predict(params)
+  end
+
+  defp filter(name, data, _, max) when name in ["ASCIIHexDecode", "AHx"],
+    do: data |> ascii_hex() |> within(max)
+
+  defp filter(name, data, _, max) when name in ["ASCII85Decode", "A85"], do: ascii85(data, max)
+
+  defp filter(name, data, _, max) when name in ["RunLengthDecode", "RL"],
+    do: run_length(data, <<>>, max)
+
+  defp filter(_crypt_or_unknown, data, _, _max), do: data
+
+  defp within(data, max) when byte_size(data) <= max, do: data
+  defp within(_data, _max), do: too_large()
+
+  defp too_large, do: throw(:embedpdf_stream_too_large)
 
   # ---------------------------------------------------------------- Flate
 
-  @doc "Inflates zlib (or raw deflate) data, keeping whatever decodes before an error."
+  @doc """
+  Inflates zlib (or raw deflate) data, keeping whatever decodes before an
+  error. Data that inflates to more than `max_bytes/0` comes back empty.
+  """
   @spec inflate(binary()) :: binary()
-  def inflate(<<>>), do: <<>>
-
   def inflate(data) do
-    case safe_inflate(data, :zlib) do
+    inflate(data, max_bytes())
+  catch
+    :throw, :embedpdf_stream_too_large -> <<>>
+  end
+
+  defp inflate(<<>>, _max), do: <<>>
+
+  defp inflate(data, max) do
+    case safe_inflate(data, :zlib, max) do
       {:ok, out} -> out
       {:error, partial} when partial != <<>> -> partial
-      {:error, _} -> try_raw(data)
+      {:error, _} -> try_raw(data, max)
+      :too_large -> too_large()
     end
   end
 
-  defp try_raw(data) do
-    case safe_inflate(data, :raw) do
+  defp try_raw(data, max) do
+    case safe_inflate(data, :raw, max) do
       {:ok, out} -> out
       {:error, partial} -> partial
+      :too_large -> too_large()
     end
   end
 
-  defp safe_inflate(data, mode) do
+  defp safe_inflate(data, mode, max) do
     z = :zlib.open()
 
     try do
@@ -99,7 +174,7 @@ defmodule EmbedPdf.PDF.Filter do
         :raw -> :zlib.inflateInit(z, -15)
       end
 
-      loop_inflate(z, :zlib.safeInflate(z, data), [])
+      loop_inflate(z, :zlib.safeInflate(z, data), [], 0, max)
     rescue
       _ -> {:error, <<>>}
     catch
@@ -109,41 +184,61 @@ defmodule EmbedPdf.PDF.Filter do
     end
   end
 
-  defp loop_inflate(z, {:continue, out}, acc) do
+  defp loop_inflate(z, {:continue, out}, acc, size, max) do
+    size = size + IO.iodata_length(out)
     acc = [acc | out]
 
-    try do
-      loop_inflate(z, :zlib.safeInflate(z, []), acc)
-    rescue
-      _ -> {:error, IO.iodata_to_binary(acc)}
-    catch
-      _, _ -> {:error, IO.iodata_to_binary(acc)}
+    if size > max do
+      :too_large
+    else
+      case inflate_more(z) do
+        {:ok, step} -> loop_inflate(z, step, acc, size, max)
+        :error -> {:error, IO.iodata_to_binary(acc)}
+      end
     end
   end
 
-  defp loop_inflate(_z, {:finished, out}, acc), do: {:ok, IO.iodata_to_binary([acc | out])}
-  defp loop_inflate(_z, {:need_dictionary, _, _}, acc), do: {:error, IO.iodata_to_binary(acc)}
+  defp loop_inflate(_z, {:finished, out}, acc, size, max) do
+    if size + IO.iodata_length(out) > max,
+      do: :too_large,
+      else: {:ok, IO.iodata_to_binary([acc | out])}
+  end
+
+  defp loop_inflate(_z, {:need_dictionary, _, _}, acc, _size, _max),
+    do: {:error, IO.iodata_to_binary(acc)}
+
+  defp inflate_more(z) do
+    {:ok, :zlib.safeInflate(z, [])}
+  rescue
+    _ -> :error
+  catch
+    _, _ -> :error
+  end
 
   # ---------------------------------------------------------------- predictors
 
   @doc false
+  # Parameters that do not describe rows that fit in the data (zero or absurd
+  # columns, colours or bit depths) leave the data as it is.
   def predict(data, params) when is_map(params) do
     predictor = Map.get(params, "Predictor", 1)
+    colors = Map.get(params, "Colors", 1)
+    bpc = Map.get(params, "BitsPerComponent", 8)
+    columns = Map.get(params, "Columns", 1)
 
-    if predictor in [nil, 1] do
-      data
-    else
-      colors = Map.get(params, "Colors", 1)
-      bpc = Map.get(params, "BitsPerComponent", 8)
-      columns = Map.get(params, "Columns", 1)
+    if is_integer(predictor) and predictor > 1 and colors in 1..32 and bpc in [1, 2, 4, 8, 16] and
+         columns in 1..@max_columns do
       bpp = max(div(colors * bpc + 7, 8), 1)
       row_len = div(colors * bpc * columns + 7, 8)
 
       cond do
+        row_len > byte_size(data) or row_len > @max_row_bytes -> data
         predictor == 2 -> tiff_predict(data, row_len, bpp, bpc, colors)
         predictor >= 10 -> png_predict(data, row_len, bpp)
         true -> data
       end
+    else
+      data
     end
   end
 
@@ -151,7 +246,7 @@ defmodule EmbedPdf.PDF.Filter do
 
   defp png_predict(data, row_len, bpp) do
     prev = :binary.copy(<<0>>, row_len)
-    png_rows(data, row_len, bpp, prev, [])
+    png_rows(data, row_len, bpp, prev, <<>>)
   end
 
   defp png_rows(<<type, rest::binary>>, row_len, bpp, prev, acc) do
@@ -162,11 +257,10 @@ defmodule EmbedPdf.PDF.Filter do
         else: {rest <> :binary.copy(<<0>>, row_len - byte_size(rest)), <<>>}
 
     decoded = unfilter(type, row, prev, bpp)
-    png_rows(rest, row_len, bpp, decoded, [decoded | acc])
+    png_rows(rest, row_len, bpp, decoded, <<acc::binary, decoded::binary>>)
   end
 
-  defp png_rows(<<>>, _row_len, _bpp, _prev, acc),
-    do: acc |> Enum.reverse() |> IO.iodata_to_binary()
+  defp png_rows(<<>>, _row_len, _bpp, _prev, acc), do: acc
 
   @doc false
   # PNG row unfiltering; also used by the PNG reader of the image pipeline.
@@ -186,13 +280,14 @@ defmodule EmbedPdf.PDF.Filter do
   def unfilter(3, row, prev, bpp) do
     cur = :binary.bin_to_list(row)
     up = :binary.bin_to_list(prev)
-    average(cur, up, List.duplicate(0, bpp), bpp, []) |> :erlang.list_to_binary()
+    average(cur, up, List.duplicate(0, bpp), [], []) |> :erlang.list_to_binary()
   end
 
   def unfilter(4, row, prev, bpp) do
     cur = :binary.bin_to_list(row)
     up = :binary.bin_to_list(prev)
-    paeth(cur, up, List.duplicate(0, bpp), List.duplicate(0, bpp), []) |> :erlang.list_to_binary()
+    zeros = List.duplicate(0, bpp)
+    paeth(cur, up, zeros, [], zeros, [], []) |> :erlang.list_to_binary()
   end
 
   def unfilter(_, row, _prev, _bpp), do: row
@@ -208,17 +303,26 @@ defmodule EmbedPdf.PDF.Filter do
     out
   end
 
-  # `lefts` holds the last bpp output bytes (oldest first)
+  # The last bpp output bytes are a queue: `lefts` is its front (oldest
+  # first), `back` what was added since, newest first.
   defp average([], _, _, _, acc), do: Enum.reverse(acc)
 
-  defp average([c | cur], [u | up], [l | lefts], bpp, acc) do
+  defp average(cur, up, [], back, acc), do: average(cur, up, Enum.reverse(back), [], acc)
+
+  defp average([c | cur], [u | up], [l | lefts], back, acc) do
     v = band(c + div(l + u, 2), 0xFF)
-    average(cur, up, lefts ++ [v], bpp, [v | acc])
+    average(cur, up, lefts, [v | back], [v | acc])
   end
 
-  defp paeth([], _, _, _, acc), do: Enum.reverse(acc)
+  defp paeth([], _, _, _, _, _, acc), do: Enum.reverse(acc)
 
-  defp paeth([c | cur], [u | up], [l | lefts], [ul | uplefts], acc) do
+  defp paeth(cur, up, [], back, uplefts, upback, acc),
+    do: paeth(cur, up, Enum.reverse(back), [], uplefts, upback, acc)
+
+  defp paeth(cur, up, lefts, back, [], upback, acc),
+    do: paeth(cur, up, lefts, back, Enum.reverse(upback), [], acc)
+
+  defp paeth([c | cur], [u | up], [l | lefts], back, [ul | uplefts], upback, acc) do
     p = l + u - ul
     pa = abs(p - l)
     pb = abs(p - u)
@@ -232,7 +336,7 @@ defmodule EmbedPdf.PDF.Filter do
       end
 
     v = band(c + pred, 0xFF)
-    paeth(cur, up, lefts ++ [v], uplefts ++ [u], [v | acc])
+    paeth(cur, up, lefts, [v | back], uplefts, [u | upback], [v | acc])
   end
 
   defp tiff_predict(data, row_len, bpp, 8, _colors) do
@@ -260,27 +364,32 @@ defmodule EmbedPdf.PDF.Filter do
 
   # ---------------------------------------------------------------- LZW
 
-  defp lzw(data, early) do
-    lzw_loop(data, 9, 258, %{}, nil, early, [])
+  defp lzw(data, early, max) do
+    lzw_loop(data, 9, 258, %{}, nil, early, <<>>, max)
   end
 
-  defp lzw_loop(data, width, next, table, prev, early, acc) do
+  defp lzw_loop(_data, _width, _next, _table, _prev, _early, acc, max)
+       when byte_size(acc) > max,
+       do: too_large()
+
+  defp lzw_loop(data, width, next, table, prev, early, acc, max) do
     case data do
       <<code::size(width), rest::bitstring>> ->
         cond do
           code == 256 ->
-            lzw_loop(rest, 9, 258, %{}, nil, early, acc)
+            lzw_loop(rest, 9, 258, %{}, nil, early, acc, max)
 
           code == 257 ->
-            acc |> Enum.reverse() |> IO.iodata_to_binary()
+            acc
 
           true ->
             entry =
               cond do
                 code < 256 -> <<code>>
                 Map.has_key?(table, code) -> table[code]
-                prev != nil -> prev <> binary_part(prev, 0, 1)
-                true -> <<>>
+                # a code that names nothing, with no string before it to extend
+                prev in [nil, <<>>] -> <<>>
+                true -> prev <> binary_part(prev, 0, 1)
               end
 
             {table, next} =
@@ -299,11 +408,11 @@ defmodule EmbedPdf.PDF.Filter do
                 true -> 9
               end
 
-            lzw_loop(rest, width, next, table, entry, early, [entry | acc])
+            lzw_loop(rest, width, next, table, entry, early, <<acc::binary, entry::binary>>, max)
         end
 
       _ ->
-        acc |> Enum.reverse() |> IO.iodata_to_binary()
+        acc
     end
   end
 
@@ -325,7 +434,7 @@ defmodule EmbedPdf.PDF.Filter do
     Base.decode16!(digits, case: :mixed)
   end
 
-  defp ascii85(data) do
+  defp ascii85(data, max) do
     data =
       data
       |> then(fn d ->
@@ -338,49 +447,49 @@ defmodule EmbedPdf.PDF.Filter do
         end
       end)
 
-    chars = for <<c <- data>>, c not in [0, 9, 10, 12, 13, 32], do: c
-    a85(chars, [], [])
+    a85(data, 0, 0, <<>>, max)
   end
 
-  defp a85([], [], out), do: out |> Enum.reverse() |> IO.iodata_to_binary()
+  # `value` holds the `n` characters of the group being read
+  defp a85(_data, _value, _n, out, max) when byte_size(out) > max, do: too_large()
 
-  defp a85([], group, out) do
-    n = length(group)
-    padded = Enum.reverse(group) ++ List.duplicate(?u, 5 - n)
-    <<bytes::binary-size(n - 1), _::binary>> = group_value(padded)
-    a85([], [], [bytes | out])
+  defp a85(<<>>, _value, 0, out, _max), do: out
+
+  defp a85(<<>>, value, n, out, _max) do
+    # a short last group is padded with `u` and gives n - 1 bytes
+    padded = Enum.reduce(1..(5 - n), value, fn _, acc -> acc * 85 + (?u - 33) end)
+    <<bytes::binary-size(n - 1), _::binary>> = <<band(padded, 0xFFFFFFFF)::32>>
+    <<out::binary, bytes::binary>>
   end
 
-  defp a85([?z | rest], [], out), do: a85(rest, [], [<<0, 0, 0, 0>> | out])
+  defp a85(<<?z, rest::binary>>, _value, 0, out, max),
+    do: a85(rest, 0, 0, <<out::binary, 0, 0, 0, 0>>, max)
 
-  defp a85([c | rest], group, out) when c in ?!..?u do
-    group = [c | group]
-
-    if length(group) == 5,
-      do: a85(rest, [], [group_value(Enum.reverse(group)) | out]),
-      else: a85(rest, group, out)
+  defp a85(<<c, rest::binary>>, value, 4, out, max) when c in ?!..?u do
+    value = value * 85 + (c - 33)
+    a85(rest, 0, 0, <<out::binary, band(value, 0xFFFFFFFF)::32>>, max)
   end
 
-  defp a85([_ | rest], group, out), do: a85(rest, group, out)
+  defp a85(<<c, rest::binary>>, value, n, out, max) when c in ?!..?u,
+    do: a85(rest, value * 85 + (c - 33), n + 1, out, max)
 
-  defp group_value(chars) do
-    value = Enum.reduce(chars, 0, fn c, acc -> acc * 85 + (c - 33) end)
-    <<band(value, 0xFFFFFFFF)::32>>
-  end
+  # whitespace and anything that is not part of the encoding
+  defp a85(<<_, rest::binary>>, value, n, out, max), do: a85(rest, value, n, out, max)
 
-  defp run_length(<<128, _::binary>>, acc), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
-  defp run_length(<<>>, acc), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
+  defp run_length(_data, acc, max) when byte_size(acc) > max, do: too_large()
+  defp run_length(<<128, _::binary>>, acc, _max), do: acc
+  defp run_length(<<>>, acc, _max), do: acc
 
-  defp run_length(<<len, rest::binary>>, acc) when len < 128 do
+  defp run_length(<<len, rest::binary>>, acc, max) when len < 128 do
     n = min(len + 1, byte_size(rest))
     <<chunk::binary-size(n), rest::binary>> = rest
-    run_length(rest, [chunk | acc])
+    run_length(rest, <<acc::binary, chunk::binary>>, max)
   end
 
-  defp run_length(<<len, byte, rest::binary>>, acc),
-    do: run_length(rest, [:binary.copy(<<byte>>, 257 - len) | acc])
+  defp run_length(<<len, byte, rest::binary>>, acc, max),
+    do: run_length(rest, <<acc::binary, :binary.copy(<<byte>>, 257 - len)::binary>>, max)
 
-  defp run_length(<<_>>, acc), do: run_length(<<>>, acc)
+  defp run_length(<<_>>, acc, max), do: run_length(<<>>, acc, max)
 
   # ---------------------------------------------------------------- encoding
 

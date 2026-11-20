@@ -478,9 +478,18 @@ defmodule EmbedPdf.Signatures do
 
   `status` is `:valid` when the signed bytes are intact and the signature
   matches its certificate; whether the certificate is *trusted* is left
-  to you (see `certificate.self_signed?` and the issuer). A later
-  incremental update leaves earlier signatures `:valid` with
-  `covers_whole_document?: false` and `modified_after?: true`.
+  to you (see `certificate.self_signed?` and the issuer).
+
+  A signature only vouches for the bytes it covers. When more was appended
+  after it (`covers_whole_document?: false`, `modified_after?: true`):
+
+    * `changed_after: :signed` and status `:valid` – every later change is
+      covered by a later valid signature over the whole file (a second
+      approval, for example);
+    * `changed_after: :unsigned` and status `:modified` – the file was
+      changed after signing and nobody signed that change. The signed
+      version is intact, but what a reader sees now may differ from it, so
+      this is never reported as plain `:valid`.
   """
   @spec validate(binary(), keyword()) :: [map()]
   def validate(pdf_bytes, opts \\ []) do
@@ -493,12 +502,14 @@ defmodule EmbedPdf.Signatures do
           end
 
         doc.objects
+        |> Enum.map(fn {num, v} -> {num, direct_range(doc, v)} end)
         |> Enum.filter(fn {_, v} -> signature_dict?(v) end)
         |> Enum.sort_by(fn {_, v} -> range_start(v) end)
         |> Enum.map(fn {num, dict} ->
           {name, id} = Map.get(named, num, {nil, nil})
           check(pdf_bytes, doc, dict, name, id)
         end)
+        |> later_changes()
 
       {:error, reason} ->
         [%{status: :unknown, errors: ["could not open: #{inspect(reason)}"]}]
@@ -507,6 +518,40 @@ defmodule EmbedPdf.Signatures do
 
   defp ref_num({:ref, n, _}), do: n
   defp ref_num(_), do: nil
+
+  # a /ByteRange kept in another object still names a signature to check
+  defp direct_range(doc, %{"ByteRange" => {:ref, _, _} = ref, "Contents" => _} = dict)
+       when not is_struct(dict) do
+    case Document.resolve(doc, ref) do
+      list when is_list(list) ->
+        %{dict | "ByteRange" => Enum.map(list, &Document.resolve(doc, &1))}
+
+      _ ->
+        dict
+    end
+  end
+
+  defp direct_range(_doc, value), do: value
+
+  # What was appended after a signature is only vouched for when a later
+  # valid signature covers the whole file; otherwise the signature is
+  # reported as :modified, not :valid.
+  defp later_changes(results) do
+    signed_to_the_end? = Enum.any?(results, &(&1.status == :valid and &1.covers_whole_document?))
+
+    Enum.map(results, fn
+      %{status: :valid, covers_whole_document?: false} = r ->
+        if signed_to_the_end?,
+          do: %{r | changed_after: :signed},
+          else: %{r | status: :modified, changed_after: :unsigned}
+
+      %{covers_whole_document?: false, byte_range: [_ | _]} = r ->
+        %{r | changed_after: if(signed_to_the_end?, do: :signed, else: :unsigned)}
+
+      r ->
+        r
+    end)
+  end
 
   defp signature_dict?(%{"ByteRange" => [_, _, _, _], "Contents" => _} = d),
     do: d["Type"] in [nil, "Sig", "DocTimeStamp"]
@@ -531,6 +576,7 @@ defmodule EmbedPdf.Signatures do
       signed_at: EmbedPdf.PDF.TextString.parse_date(Document.resolve(doc, dict["M"])),
       covers_whole_document?: false,
       modified_after?: false,
+      changed_after: nil,
       digest_ok?: false,
       signature_ok?: false,
       certificate: nil,
